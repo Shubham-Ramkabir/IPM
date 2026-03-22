@@ -1,0 +1,17 @@
+# Environment — never commit API keys
+.env
+
+# Dependencies
+node_modules/
+
+# macOS
+.DS_Store
+
+# SQLite DB (user-local data)
+~/.ipm/
+
+# Kiro IDE workspace files
+.kiro/
+
+# Build artifacts
+*.log

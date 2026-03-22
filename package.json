@@ -1,0 +1,28 @@
+{
+  "name": "ipm-terminal-frontend",
+  "version": "2.0.0",
+  "type": "module",
+  "bin": {
+    "IPM": "./bin/ipm.js"
+  },
+  "scripts": {
+    "start": "node bin/ipm.js",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest"
+  },
+  "dependencies": {
+    "@notionhq/client": "^5.14.0",
+    "better-sqlite3": "^12.8.0",
+    "chalk": "^5.6.2",
+    "chokidar": "^5.0.0",
+    "dotenv": "^17.3.1",
+    "figlet": "^1.11.0",
+    "groq-sdk": "^1.1.1",
+    "ink": "^6.8.0",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.2.4"
+  },
+  "devDependencies": {
+    "fast-check": "^4.6.0",
+    "jest": "^30.3.0"
+  }
+}
