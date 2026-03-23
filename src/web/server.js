@@ -24,6 +24,20 @@ const DATA_DIR = path.join(os.homedir(), '.ipm');
 const FRAME_PATH = path.join(DATA_DIR, 'vision_frame.png');
 const STATE_PATH = path.join(DATA_DIR, 'kiro_state.json');
 const PORT = process.env.IPM_PORT || 3000;
+const ENV_PATH = path.join(__dirname, '../../.env');
+
+function writeCursorKeyToEnv(key) {
+  try {
+    let content = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, 'utf8') : '';
+    if (/^CURSOR_API_KEY=/m.test(content)) {
+      content = content.replace(/^CURSOR_API_KEY=.*/m, `CURSOR_API_KEY=${key}`);
+    } else {
+      content = content.trimEnd() + `\nCURSOR_API_KEY=${key}\n`;
+    }
+    fs.writeFileSync(ENV_PATH, content, 'utf8');
+    process.env.CURSOR_API_KEY = key;
+  } catch {}
+}
 
 const app = express();
 app.use(express.json());
@@ -82,6 +96,8 @@ app.get('/docs', async (_req, res) => {
   try {
     const token = getConfig('notion_token');
     if (!token) return res.json({ ok: false, error: 'no_token' });
+    const cursorKey = getConfig('cursor_api_key');
+    if (!cursorKey) return res.json({ ok: false, error: 'no_cursor_key' });
     initNotion(token);
     const docs = await listDocs();
     res.json({ ok: true, docs });
@@ -103,6 +119,16 @@ app.post('/token', async (req, res) => {
   } catch (e) {
     res.json({ ok: false, error: e.message });
   }
+});
+
+// ── Cursor: save API key ──────────────────────────────────────────────────────
+
+app.post('/cursor-key', (req, res) => {
+  const { key } = req.body;
+  if (!key) return res.json({ ok: false, error: 'missing key' });
+  setConfig('cursor_api_key', key);
+  writeCursorKeyToEnv(key);
+  res.json({ ok: true });
 });
 
 // ── Run build ─────────────────────────────────────────────────────────────────

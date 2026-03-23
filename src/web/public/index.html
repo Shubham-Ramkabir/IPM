@@ -139,6 +139,27 @@
       </div>
     </div>
 
+    <!-- Cursor key setup -->
+    <div id="cursor-screen" class="view hidden">
+      <div class="setup-card">
+        <img src="https://raw.githubusercontent.com/lobehub/lobe-icons/refs/heads/master/packages/static-png/dark/cursor.png"
+          data-dark-src="https://raw.githubusercontent.com/lobehub/lobe-icons/refs/heads/master/packages/static-png/dark/cursor.png"
+          data-light-src="https://www.logoshape.com/wp-content/uploads/2025/03/Cursor_Vector_Logo.png"
+          class="notion-logo-big" alt="Cursor" style="border-radius:12px" />
+        <h1>Connect to Cursor</h1>
+        <p>IPM uses your Cursor API Key to inject prompts directly into Cursor. Your key is stored locally and never committed.</p>
+        <a href="https://cursor.com/settings" target="_blank" class="link-hint">Find your key at cursor.com/settings →</a>
+        <div class="input-group">
+          <input id="cursor-key-input" type="password" placeholder="crsr_..." autocomplete="off" spellcheck="false" />
+          <button id="cursor-key-btn" class="btn btn-primary">
+            <svg class="btn-icon"><use href="#icon-arrow-right"/></svg>
+            Save
+          </button>
+        </div>
+        <div id="cursor-key-error" class="error-msg hidden"></div>
+      </div>
+    </div>
+
     <!-- Doc picker -->
     <div id="docs-screen" class="view hidden">
       <div class="docs-header">

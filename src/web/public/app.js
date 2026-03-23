@@ -78,6 +78,8 @@ async function init() {
   const res = await fetch('/docs').then(r => r.json()).catch(() => ({ error: 'network' }));
   if (res.error === 'no_token' || res.error === 'network') {
     showView('token-screen');
+  } else if (res.error === 'no_cursor_key') {
+    showView('cursor-screen');
   } else if (res.ok) {
     renderDocs(res.docs);
   }
@@ -138,7 +140,11 @@ $('token-btn').addEventListener('click', async () => {
   $('token-btn').disabled = false;
   if (res.ok) {
     const docs = await fetch('/docs').then(r => r.json());
-    renderDocs(docs.docs || []);
+    if (docs.error === 'no_cursor_key') {
+      showView('cursor-screen');
+    } else {
+      renderDocs(docs.docs || []);
+    }
   } else {
     $('token-error').textContent = res.error;
     $('token-error').classList.remove('hidden');
@@ -146,6 +152,31 @@ $('token-btn').addEventListener('click', async () => {
 });
 
 $('token-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('token-btn').click(); });
+
+// ── Cursor key setup ──────────────────────────────────────────────────────────
+$('cursor-key-btn').addEventListener('click', async () => {
+  const key = $('cursor-key-input').value.trim();
+  if (!key) return;
+  $('cursor-key-btn').disabled = true;
+  $('cursor-key-error').classList.add('hidden');
+
+  const res = await fetch('/cursor-key', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key }),
+  }).then(r => r.json()).catch(e => ({ ok: false, error: e.message }));
+
+  $('cursor-key-btn').disabled = false;
+  if (res.ok) {
+    const docs = await fetch('/docs').then(r => r.json());
+    renderDocs(docs.docs || []);
+  } else {
+    $('cursor-key-error').textContent = res.error;
+    $('cursor-key-error').classList.remove('hidden');
+  }
+});
+
+$('cursor-key-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('cursor-key-btn').click(); });
 
 // ── Doc picker ────────────────────────────────────────────────────────────────
 function renderDocs(docs) {

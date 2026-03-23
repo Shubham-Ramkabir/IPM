@@ -5,6 +5,7 @@ import * as dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { Transform } from 'stream';
+import fs from 'fs';
 import { getConfig, setConfig } from '../db/index.js';
 import { initNotion, listDocs } from '../agent/notion.js';
 import { runBuild } from '../agent/runner.js';
@@ -14,6 +15,21 @@ import { ScreenPreview } from './ScreenPreview.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, '../../.env') });
+
+const ENV_PATH = join(__dirname, '../../.env');
+
+function writeCursorKeyToEnv(key) {
+  try {
+    let content = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, 'utf8') : '';
+    if (/^CURSOR_API_KEY=/m.test(content)) {
+      content = content.replace(/^CURSOR_API_KEY=.*/m, `CURSOR_API_KEY=${key}`);
+    } else {
+      content = content.trimEnd() + `\nCURSOR_API_KEY=${key}\n`;
+    }
+    fs.writeFileSync(ENV_PATH, content, 'utf8');
+    process.env.CURSOR_API_KEY = key;
+  } catch {}
+}
 
 let ipmArt = 'IPM';
 try { ipmArt = figlet.textSync('IPM', { font: 'Small' }); } catch (_) {}
@@ -175,33 +191,61 @@ function Splash({ onDone }) {
 
 // Token setup screen
 function TokenSetup({ onDone }) {
+  const [step, setStep] = useState('notion'); // 'notion' | 'cursor'
+  const [notionToken, setNotionToken] = useState('');
   const [value, setValue] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const { exit } = useApp();
+
   useInput((inp, key) => {
     if (loading) return;
     if (key.escape || (key.ctrl && inp === 'c')) { exit(); return; }
     if (key.return) {
       const t = value.trim();
-      if (!t) { setError('Token cannot be empty'); return; }
+      if (!t) { setError('Cannot be empty'); return; }
       setLoading(true); setError('');
-      initNotion(t);
-      listDocs()
-        .then(() => { setConfig('notion_token', t); onDone(t); })
-        .catch(e => { setLoading(false); setError('Invalid token: ' + e.message); });
+
+      if (step === 'notion') {
+        initNotion(t);
+        listDocs()
+          .then(() => {
+            setConfig('notion_token', t);
+            setNotionToken(t);
+            setValue('');
+            setStep('cursor');
+            setLoading(false);
+          })
+          .catch(e => { setLoading(false); setError('Invalid token: ' + e.message); });
+      } else {
+        // Cursor API key — store in db + write to .env
+        setConfig('cursor_api_key', t);
+        writeCursorKeyToEnv(t);
+        setLoading(false);
+        onDone(notionToken);
+      }
       return;
     }
     if (key.backspace || key.delete) { setValue(v => v.slice(0, -1)); return; }
     if (inp && !key.ctrl && !key.meta) setValue(v => v + inp);
   });
+
+  const isNotion = step === 'notion';
+  const label    = isNotion ? 'Notion Integration Token' : 'Cursor API Key';
+  const hint     = isNotion
+    ? 'Create one at: notion.so/my-integrations'
+    : 'Find yours at: cursor.com/settings → API Keys';
+  const stepText = isNotion ? 'Step 1 of 2' : 'Step 2 of 2';
+
   return h(Box, { flexDirection: 'column', borderStyle: 'round', borderColor: ORANGE, paddingX: 2, paddingY: 1 },
-    h(Text, { color: ORANGE, bold: true }, '🦞 IPM - First Time Setup'),
+    h(Text, { color: ORANGE, bold: true }, '🦞 IPM - First Time Setup  (' + stepText + ')'),
     h(Box, { marginTop: 1 }),
-    h(Text, { wrap: 'wrap' }, 'IPM needs your Notion Integration Token to read your project documentation.'),
-    h(Text, { dimColor: true }, 'Create one at: notion.so/my-integrations'),
+    h(Text, { wrap: 'wrap' }, isNotion
+      ? 'IPM needs your Notion Integration Token to read your project documentation.'
+      : 'IPM needs your Cursor API Key to inject prompts directly into Cursor.'),
+    h(Text, { dimColor: true }, hint),
     h(Box, { marginTop: 1 }),
-    h(Text, { color: ORANGE }, 'Paste your Notion Integration Token:'),
+    h(Text, { color: ORANGE }, 'Paste your ' + label + ':'),
     h(Box, { borderStyle: 'round', borderColor: loading ? 'gray' : ORANGE, paddingX: 1, marginTop: 1 },
       h(Text, { color: ORANGE, bold: true }, '> '),
       h(Text, null, loading ? 'Validating...' : (value || ' ')),
@@ -337,7 +381,8 @@ function App() {
     ensureBridgeInstalled();
     spawnDaemons();
     const token = getConfig('notion_token');
-    if (token) { initNotion(token); setPhase('loading_docs'); }
+    const cursorKey = getConfig('cursor_api_key');
+    if (token && cursorKey) { initNotion(token); setPhase('loading_docs'); }
     else setPhase('token');
   }, [phase]);
 
