@@ -4,7 +4,7 @@
 
 > **Intelligent Project Manager** — An autonomous multi-agent IDE automation system powered by Groq.
 
-IPM reads your project documentation from Notion, thinks about it using a team of specialized AI agents, and autonomously builds the project inside your IDE. You watch it happen in real time from a beautiful terminal UI.
+IPM reads your project documentation from Notion, thinks about it using a team of specialized AI agents, and autonomously builds the project inside your IDE — while you watch it happen in real time from a web dashboard or terminal UI.
 
 ---
 
@@ -16,10 +16,34 @@ IPM is not a chatbot. It is an **autonomous build agent** that:
 2. Spins up a team of 5 specialized AI agents
 3. Each agent has a specific role and the best model for that role
 4. Agents communicate with each other in real time
-5. IPM sends precise prompts to your IDE step by step
-6. The IDE builds the project while IPM watches, validates, and corrects
+5. IPM sends precise prompts to your IDE (Kiro or Cursor) step by step
+6. A live vision watcher monitors the IDE screen in real time — it knows when the IDE is writing, thinking, or waiting for input
+7. The IDE builds the project while IPM watches, validates, and corrects
 
-You open IPM in your terminal, pick a Notion doc, and watch your project get built.
+You open IPM, pick a Notion doc, and watch your project get built.
+
+---
+
+## Two Ways to Run
+
+### Web Dashboard — `npm run dev`
+
+A full browser-based dashboard with:
+- Live screen preview of the IDE (updated every ~350ms)
+- Chat-style agent activity log
+- Kiro / Cursor IDE selector
+- Light and dark theme toggle
+- Notion doc picker with logo
+- Real-time IDE state badge (Idle / Writing / Thinking / Input Needed)
+
+### Terminal UI — `IPM`
+
+A compact Ink-based TUI in your terminal with:
+- Notion token setup and doc picker
+- Live inter-agent message feed
+- IDE state and step progress
+
+Both modes run the same underlying agent pipeline. You can use either or both simultaneously.
 
 ---
 
@@ -31,12 +55,12 @@ You open IPM in your terminal, pick a Notion doc, and watch your project get bui
 graph TD
     A[Notion Documentation] --> B[Orchestrator Agent]
     B -->|build plan| C[Prompt Writer Agent]
-    C -->|crafted prompt| D[IDE via Bridge]
+    C -->|crafted prompt| D[IDE via Bridge / Vision]
     D -->|files created| E[File Analyst Agent]
     E -->|analysis report| F[Checker Agent]
     F -->|pass / retry| B
     B -->|step summary| G[Status Agent]
-    G -->|one-liner| H[TUI Status Panel]
+    G -->|one-liner| H[Dashboard / TUI]
 
     style B fill:#FF6400,color:#fff
     style C fill:#00ccff,color:#000
@@ -52,15 +76,77 @@ graph TD
 |---|---|---|
 | Orchestrator | `moonshotai/kimi-k2-instruct` | Reads docs, creates build plan, coordinates all agents |
 | Prompt Writer | `moonshotai/kimi-k2-instruct` | Converts steps into precise IDE prompts |
-| File Analyst | `moonshotai/kimi-k2-instruct-0905` | Reads file tree, assesses what was built |
+| File Analyst | `moonshotai/kimi-k2-instruct` | Reads file tree, assesses what was built |
 | Checker | `groq/compound` | Validates each step, decides pass or retry |
-| Status Agent | `llama-3.1-8b-instant` | Produces fast human-readable status lines for TUI |
+| Status Agent | `llama-3.1-8b-instant` | Produces fast human-readable status lines |
 
-> Models are fetched **live** from the Groq API on every run. The best available model is auto-assigned to each role — no hardcoded lists.
+> Models are fetched **live** from the Groq API on every run. The best available model is auto-assigned to each role.
 
-### Inter-Agent Communication
+---
 
-All agents share a **MessageBus**. Every message between agents is visible in the TUI in real time — you can watch `Orchestrator → PromptWriter`, `FileAnalyst → Checker`, `Checker → Orchestrator` as they happen.
+## Vision Watcher
+
+IPM includes a persistent background vision process (`src/vision/watcher.js`) that acts as the eyes of the system.
+
+- Captures the screen every **300ms** using `screencapture`
+- Sends frames to the **Groq vision model** over a keep-alive HTTPS connection
+- Classifies IDE state in real time: `idle` · `writing` · `thinking` · `waiting_for_input`
+- Caches input bar coordinates and handles Retina display scaling automatically
+- **Autonomously handles `waiting_for_input`** — clicks buttons and submits answers without waiting for a command
+- IPM only injects the next prompt when the IDE has been stably `idle` for 1500ms
+- Listens on `~/.ipm/vision.sock` for `send_prompt` and `get_state` commands
+
+The vision watcher starts automatically when IPM starts — no manual setup needed.
+
+```mermaid
+graph LR
+    SCREEN[Screen Capture 300ms] --> GROQ[Groq Vision Model]
+    GROQ -->|idle / writing / thinking / waiting_for_input| STATE[State Cache]
+    STATE --> RUNNER[Agent Runner]
+    STATE --> DASHBOARD[Web Dashboard]
+    STATE -->|auto-click| INPUT[IDE Input Buttons]
+```
+
+---
+
+## IDE Support
+
+IPM supports two IDEs, selectable from the web dashboard sidebar:
+
+| IDE | Method | Notes |
+|---|---|---|
+| **Kiro** | VS Code extension bridge + vision watcher | Default |
+| **Cursor** | Direct API injection via Cursor API | Uses `crsr_` API key |
+
+The IDE bridge extension auto-installs to `~/.kiro/extensions/ipm.ide-bridge-1.0.0/` on first run.
+
+---
+
+## Web Dashboard
+
+Start with:
+
+```bash
+npm run dev
+```
+
+Opens automatically in your browser at `http://localhost:3000`.
+
+### Features
+
+- **Live Preview** — real-time screen capture of the IDE, updated every 350ms
+- **Agent Activity Log** — chat-style feed of every agent action, color-coded by type
+- **IDE Selector** — switch between Kiro and Cursor with logo buttons
+- **Notion Doc Picker** — browse and select your Notion pages
+- **State Badge** — live IDE state indicator (Idle / Writing / Thinking / Input Needed)
+- **Light / Dark Theme** — toggle with sun/moon button in sidebar, persisted to localStorage
+- **Elapsed Timer** — tracks how long the current build has been running
+
+---
+
+## Inter-Agent Communication
+
+All agents share a **MessageBus**. Every message is visible in the dashboard and TUI in real time.
 
 ```mermaid
 sequenceDiagram
@@ -75,7 +161,7 @@ sequenceDiagram
     loop For each step
         O->>PW: step description
         PW->>PW: craft precise prompt
-        PW->>K: send prompt via bridge
+        PW->>K: send prompt via bridge/vision
         K->>K: build files
         FA->>FA: scan file tree
         FA->>CH: analysis report
@@ -84,105 +170,6 @@ sequenceDiagram
         SA->>TUI: status line
     end
 ```
-
-### System Architecture
-
-```mermaid
-graph LR
-    subgraph Terminal
-        TUI[Ink TUI]
-    end
-
-    subgraph Agents
-        BUS[MessageBus]
-        ORC[Orchestrator]
-        PW[PromptWriter]
-        FA[FileAnalyst]
-        CH[Checker]
-        SA[StatusAgent]
-    end
-
-    subgraph External
-        NOTION[Notion API]
-        GROQ[Groq API]
-        IDE[IDE]
-    end
-
-    subgraph Storage
-        DB[(SQLite ~/.ipm/ipm.db)]
-        FS[~/Documents/IPM Projects/]
-    end
-
-    TUI --> BUS
-    BUS --> ORC
-    BUS --> PW
-    BUS --> FA
-    BUS --> CH
-    BUS --> SA
-    ORC --> GROQ
-    PW --> GROQ
-    FA --> GROQ
-    CH --> GROQ
-    SA --> GROQ
-    ORC --> NOTION
-    PW --> IDE
-    FA --> FS
-    ORC --> DB
-```
-
----
-
-## IDE Bridge Extension
-
-IPM controls your IDE through a **VS Code-compatible extension** (`ide-extension/`) that:
-
-- Listens on a Unix socket at `~/.ipm/ide.sock`
-- Receives JSON messages from IPM CLI
-- Opens folders, sends prompts to the IDE agent panel, reads files, lists directories
-- Writes a `~/.ipm/bridge.ready` file when active so IPM knows the IDE is connected
-
-The extension is **auto-installed** on first run — IPM copies it to `~/.kiro/extensions/ipm.ide-bridge-1.0.0/` automatically. You just need to restart your IDE once.
-
-```mermaid
-graph LR
-    IPM[IPM CLI] -->|JSON over Unix socket| SOCK[~/.ipm/ide.sock]
-    SOCK --> EXT[IPM IDE Bridge Extension]
-    EXT -->|executeCommand| IDE[IDE Agent Panel]
-    EXT -->|readFileSync| FILES[Project Files]
-    EXT -->|walkDir| TREE[File Tree]
-```
-
----
-
-## TUI — Terminal UI
-
-IPM runs entirely in your terminal using **Ink** (React for CLIs).
-
-### Screens
-
-**Splash** — Animated lobster ASCII art on startup
-
-**Token Setup** — First-run Notion token entry (stored in SQLite, never re-asked)
-
-**Doc Picker** — Scrollable list of all your Notion pages
-
-**Agent Communications Panel** — Live feed of every inter-agent message, color-coded by agent:
-
-```
-Orchestrator  →  ALL          *  Plan: 6 steps for "my-saas-app"
-PromptWriter  →  IDE          >  Prompt ready (412 chars) for step 1
-FileAnalyst   →  Checker      #  3 files found: index.js, package.json, README.md
-Checker       →  Orchestrator v  Step passed: project structure created correctly
-StatusAgent   →  TUI          .  Setting up project scaffold
-```
-
-Color legend:
-- 🟠 **Orchestrator** — orange
-- 🔵 **PromptWriter** — cyan
-- 🔷 **FileAnalyst** — blue
-- 🟡 **Checker** — yellow
-- ⚫ **StatusAgent** — gray
-- 🟢 **IDE** — green
 
 ---
 
@@ -193,9 +180,9 @@ Color legend:
 - Node.js 18+
 - A [Groq API key](https://console.groq.com/) (free tier works)
 - A [Notion Integration Token](https://www.notion.so/my-integrations)
-- [Kiro IDE](https://kiro.dev/) or any VS Code-compatible IDE installed
+- [Kiro](https://kiro.dev/) or [Cursor](https://cursor.sh/) installed
 
-### Install Globally
+### Install
 
 ```bash
 git clone https://github.com/Shubham-Ramkabir/IPM.git
@@ -204,19 +191,16 @@ npm install --legacy-peer-deps
 npm install -g . --legacy-peer-deps --prefix ~/.npm-global
 ```
 
-Add to your shell profile if not already:
+Add to your shell profile if needed:
 
 ```bash
 export PATH="$HOME/.npm-global/bin:$PATH"
 ```
 
-### Configure API Key
-
-Create a `.env` file in the project root:
+### Configure
 
 ```bash
 cp .env.example .env
-# Edit .env and add your Groq API key
 ```
 
 ```env
@@ -225,34 +209,17 @@ GROQ_API_KEY=your_groq_api_key_here
 
 ---
 
-## First Run
+## Running IPM
 
 ```bash
+# Web dashboard (opens browser automatically)
+npm run dev
+
+# Terminal UI
 IPM
 ```
 
-1. Splash screen plays
-2. IPM asks for your Notion Integration Token (one time only)
-3. Your Notion pages load in a scrollable list
-4. Pick a project doc
-5. IPM starts the multi-agent pipeline
-6. Watch agents communicate in real time in the terminal
-7. Your IDE builds the project in `~/Documents/IPM Projects/<project-name>/`
-
----
-
-## Project Output
-
-All projects are created at:
-
-```
-~/Documents/IPM Projects/
-└── your-project-name/
-    ├── src/
-    ├── package.json
-    ├── README.md
-    └── ...
-```
+Both start the vision watcher daemon automatically in the background.
 
 ---
 
@@ -267,15 +234,25 @@ IPM/
 │   │   └── index.js            # Ink TUI — all screens and agent comms panel
 │   ├── agent/
 │   │   ├── agents.js           # 5 agents + MessageBus + live model fetching
-│   │   ├── runner.js           # Build pipeline orchestration
-│   │   ├── ide.js              # IDE bridge client + auto-install
+│   │   ├── runner.js           # Build pipeline — supports kiro + cursor
+│   │   ├── ide.js              # IDE bridge client + vision watcher routing
+│   │   ├── cursor.js           # Cursor API integration
+│   │   ├── daemons.js          # Vision watcher auto-spawn
 │   │   └── notion.js           # Notion API client
+│   ├── vision/
+│   │   └── watcher.js          # Persistent vision process (Groq vision model)
+│   ├── web/
+│   │   ├── server.js           # Express server — SSE, /frame, /run, /docs
+│   │   └── public/
+│   │       ├── index.html      # Single-page dashboard
+│   │       ├── app.js          # Dashboard JS — SSE, frame poller, theme
+│   │       └── style.css       # Orange + white design, dark/light themes
 │   └── db/
 │       └── index.js            # SQLite config + run history
 ├── ide-extension/
 │   ├── extension.js            # VS Code extension — Unix socket server
 │   └── package.json
-├── .env.example                # API key template
+├── .env.example
 ├── package.json
 └── Readme.md
 ```
@@ -289,14 +266,14 @@ flowchart TD
     A[User picks Notion doc] --> B[Read page content recursively]
     B --> C[Orchestrator analyses doc]
     C --> D[Build plan: N steps]
-    D --> E[Create project folder in ~/Documents/IPM Projects/]
-    E --> F[Wait for IDE bridge]
+    D --> E[Create project folder]
+    E --> F[Wait for IDE bridge / vision watcher]
     F --> G[Open project in IDE]
     G --> H{For each step}
     H --> I[Read current file tree]
     I --> J[PromptWriter crafts IDE prompt]
-    J --> K[Send prompt to IDE via bridge]
-    K --> L[Wait for IDE to go idle]
+    J --> K[Send prompt to IDE]
+    K --> L[Vision watcher waits for idle]
     L --> M[FileAnalyst scans files]
     M --> N[Checker validates step]
     N -->|retry| H
@@ -309,10 +286,10 @@ flowchart TD
 
 ## Data & Privacy
 
-- Your Notion token is stored locally in `~/.ipm/ipm.db` (SQLite)
-- Your Groq API key stays in `.env` — never committed to git
-- Run history is stored locally in `~/.ipm/ipm.db`
-- Nothing is sent anywhere except Groq API (for LLM calls) and Notion API (for doc reading)
+- Notion token stored locally in `~/.ipm/ipm.db` (SQLite)
+- Groq API key stays in `.env` — never committed
+- Run history stored locally in `~/.ipm/ipm.db`
+- Nothing sent anywhere except Groq API (LLM calls) and Notion API (doc reading)
 
 ---
 
@@ -320,26 +297,15 @@ flowchart TD
 
 | Layer | Technology |
 |---|---|
+| Web Dashboard | Express + SSE + vanilla JS |
 | Terminal UI | [Ink](https://github.com/vadimdemedes/ink) (React for CLIs) |
 | LLM Provider | [Groq](https://groq.com/) — ultra-fast inference |
+| Vision | Groq vision model — live screen classification |
 | Models | Kimi K2, Groq Compound, Llama 3.1 |
 | Notion | [@notionhq/client](https://github.com/makenotion/notion-sdk-js) |
 | Database | [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) |
-| File Watching | [chokidar](https://github.com/paulmillr/chokidar) |
 | IDE Bridge | VS Code Extension API (Unix socket) |
-| ASCII Art | [figlet](https://github.com/patorjk/figlet.js) |
-
----
-
-## Development
-
-```bash
-# Run directly without global install
-node bin/ipm.js
-
-# Smoke test (checks imports, shows splash)
-node -e "import('./src/tui/index.js').catch(e => { process.stderr.write(e.stack); process.exit(1); }); setTimeout(() => process.exit(0), 1500);"
-```
+| Cursor | Cursor API direct injection |
 
 ---
 
@@ -353,4 +319,4 @@ MIT
 
 **Shubham Ramkabir** — AI-First Developer @ E2M
 
-Powered by [Groq](https://groq.com/) · [Kiro](https://kiro.dev/) · [Notion](https://notion.so/)
+Powered by [Groq](https://groq.com/) · [Kiro](https://kiro.dev/) · [Notion](https://notion.so/) · [Cursor](https://cursor.sh/)
