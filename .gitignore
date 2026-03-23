@@ -17,4 +17,4 @@ node_modules/
 *.log
 
 #Ignore This
-.vscode/
+.vscode/.vscode/
