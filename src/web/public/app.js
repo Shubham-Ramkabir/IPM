@@ -31,7 +31,36 @@ const STATE_LABEL = {
   waiting_for_input: 'Input Needed',
 };
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── Theme ─────────────────────────────────────────────────────────────────────
+const NOTION_DARK  = 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQ16vftkaN8OYW8rNPvNjpuemjEUmumeibwyw&s';
+const NOTION_LIGHT = 'https://www.pngall.com/wp-content/uploads/15/Notion-Logo-PNG-File.png';
+const CURSOR_DARK  = 'https://raw.githubusercontent.com/lobehub/lobe-icons/refs/heads/master/packages/static-png/dark/cursor.png';
+const CURSOR_LIGHT = 'https://www.logoshape.com/wp-content/uploads/2025/03/Cursor_Vector_Logo.png';
+
+function setupTheme() {
+  const isLight = localStorage.getItem('theme') === 'light';
+  applyTheme(isLight);
+
+  $('theme-toggle').addEventListener('click', () => {
+    const nowLight = !document.body.classList.contains('light');
+    localStorage.setItem('theme', nowLight ? 'light' : 'dark');
+    applyTheme(nowLight);
+  });
+}
+
+function applyTheme(light) {
+  document.body.classList.toggle('light', light);
+  $('theme-icon-sun').classList.toggle('hidden', light);
+  $('theme-icon-moon').classList.toggle('hidden', !light);
+  $('theme-label').textContent = light ? 'Dark mode' : 'Light mode';
+
+  // Swap all theme-aware images
+  document.querySelectorAll('[data-dark-src]').forEach(img => {
+    img.src = light ? img.dataset.lightSrc : img.dataset.darkSrc;
+  });
+}
+
+
 let selectedIde = 'kiro';
 let runStartedAt = null;
 let elapsedTimer = null;
@@ -44,6 +73,7 @@ const $ = id => document.getElementById(id);
 async function init() {
   setupNav();
   setupIdeSelector();
+  setupTheme();
 
   const res = await fetch('/docs').then(r => r.json()).catch(() => ({ error: 'network' }));
   if (res.error === 'no_token' || res.error === 'network') {
@@ -127,8 +157,11 @@ function renderDocs(docs) {
   docs.forEach(doc => {
     const card = document.createElement('div');
     card.className = 'doc-card';
-    card.innerHTML = `
-      <img src="https://www.pngall.com/wp-content/uploads/15/Notion-Logo-PNG-File.png" class="doc-card-icon" alt="" />
+    const notionSrc = document.body.classList.contains('light') ? NOTION_LIGHT : NOTION_DARK;    card.innerHTML = `
+      <img src="${notionSrc}"
+        data-dark-src="${NOTION_DARK}"
+        data-light-src="${NOTION_LIGHT}"
+        class="doc-card-icon" alt="" />
       <span class="doc-card-title">${esc(doc.title)}</span>
     `;
     card.addEventListener('click', () => startRun(doc));
