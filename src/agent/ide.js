@@ -5,12 +5,23 @@ import os from 'os';
 import { execSync } from 'child_process';
 
 const SOCK_PATH = path.join(os.homedir(), '.ipm', 'ide.sock');
+const VISION_SOCK = path.join(os.homedir(), '.ipm', 'vision.sock');
 const READY_FILE = path.join(os.homedir(), '.ipm', 'bridge.ready');
+const VISION_READY = path.join(os.homedir(), '.ipm', 'vision.ready');
 
 // ── Connect to the IPM Bridge extension socket ────────────────────────────────
 function connect() {
   return new Promise((resolve, reject) => {
     const sock = net.createConnection(SOCK_PATH);
+    sock.once('connect', () => resolve(sock));
+    sock.once('error', reject);
+  });
+}
+
+// Connect to the Vision Watcher socket
+function connectVision() {
+  return new Promise((resolve, reject) => {
+    const sock = net.createConnection(VISION_SOCK);
     sock.once('connect', () => resolve(sock));
     sock.once('error', reject);
   });
@@ -85,11 +96,25 @@ export async function isBridgeReady() {
   return fs.existsSync(READY_FILE) && fs.existsSync(SOCK_PATH);
 }
 
+export function isVisionReady() {
+  return fs.existsSync(VISION_READY);
+}
+
 export async function waitForBridge(timeoutMs = 15000, onStatus) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (await isBridgeReady()) return true;
     onStatus?.('Waiting for IDE to connect…');
+    await sleep(1000);
+  }
+  return false;
+}
+
+export async function waitForVision(timeoutMs = 30000, onStatus) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (isVisionReady()) return true;
+    onStatus?.('Waiting for vision watcher…');
     await sleep(1000);
   }
   return false;
@@ -105,6 +130,18 @@ export async function openFolder(folderPath) {
 }
 
 export async function sendPrompt(text) {
+  // Vision watcher handles: wait for idle → click input → type → submit
+  if (fs.existsSync(VISION_READY)) {
+    try {
+      const sock = await connectVision();
+      const res = await send(sock, { type: 'send_prompt', text });
+      sock.destroy();
+      return res;
+    } catch {
+      // Fall through to legacy bridge path
+    }
+  }
+  // Legacy: direct bridge socket
   const sock = await connect();
   const res = await send(sock, { type: 'prompt', text });
   sock.destroy();
@@ -136,6 +173,81 @@ export async function pollKiroStatus() {
     return res.status || 'working';
   } catch {
     return 'working';
+  }
+}
+
+// Poll current KiroState — prefers vision watcher, falls back to bridge
+export async function pollKiroState() {
+  // Try vision watcher first (real-time, live)
+  if (fs.existsSync(VISION_READY)) {
+    try {
+      const sock = await connectVision();
+      const res = await send(sock, { type: 'get_state' });
+      sock.destroy();
+      if (res.ok && res.state !== undefined) {
+        return { state: res.state, since: res.since, lastResponseText: res.lastResponseText ?? '' };
+      }
+    } catch {}
+  }
+  // Fall back to bridge socket
+  try {
+    const sock = await connect();
+    const res = await send(sock, { type: 'get_kiro_state' });
+    sock.destroy();
+    if (!res.ok || res.state === undefined) {
+      return { state: 'idle', since: Date.now(), lastResponseText: '' };
+    }
+    return { state: res.state, since: res.since, lastResponseText: res.lastResponseText };
+  } catch {
+    return { state: 'idle', since: Date.now(), lastResponseText: '' };
+  }
+}
+
+// Get the last captured response text
+export async function getLastResponse() {
+  if (fs.existsSync(VISION_READY)) {
+    try {
+      const sock = await connectVision();
+      const res = await send(sock, { type: 'get_state' });
+      sock.destroy();
+      if (res.ok) return res.lastResponseText ?? '';
+    } catch {}
+  }
+  try {
+    const sock = await connect();
+    const res = await send(sock, { type: 'get_last_response' });
+    sock.destroy();
+    if (!res.ok) return '';
+    return res.text ?? '';
+  } catch {
+    return '';
+  }
+}
+
+// Read terminal snapshot from disk (~/.ipm/terminal_snapshot.txt)
+export async function readTerminalSnapshot() {
+  const snapshotPath = path.join(os.homedir(), '.ipm', 'terminal_snapshot.txt');
+  try {
+    return fs.readFileSync(snapshotPath, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+// Trigger UIInteractor — vision watcher handles this autonomously now,
+// but this is kept for manual/fallback calls from runner.js
+export async function handleUiInteraction() {
+  // Vision watcher auto-handles waiting_for_input in its loop — nothing to do
+  if (fs.existsSync(VISION_READY)) {
+    return { ok: true, action: 'handled_by_vision_watcher' };
+  }
+  try {
+    const sock = await connect();
+    const res = await send(sock, { type: 'handle_ui_interaction' });
+    sock.destroy();
+    return { ok: res.ok ?? false, action: res.action ?? 'unknown' };
+  } catch {
+    return { ok: false, action: 'socket_error' };
   }
 }
 

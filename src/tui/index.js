@@ -9,6 +9,8 @@ import { getConfig, setConfig } from '../db/index.js';
 import { initNotion, listDocs } from '../agent/notion.js';
 import { runBuild } from '../agent/runner.js';
 import { ensureBridgeInstalled } from '../agent/ide.js';
+import { spawnDaemons } from '../agent/daemons.js';
+import { ScreenPreview } from './ScreenPreview.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, '../../.env') });
@@ -19,25 +21,29 @@ try { ipmArt = figlet.textSync('IPM', { font: 'Small' }); } catch (_) {}
 const ORANGE = '#FF6400';
 
 const AGENT_COLOR = {
-  orchestrator: '#FF6400',
-  promptWriter:  '#00ccff',
-  fileAnalyst:   '#6699ff',
-  checker:       '#ffcc00',
-  statusAgent:   '#aaaaaa',
-  kiro:          '#00ff88',
-  tui:           '#ffffff',
-  all:           '#888888',
+  orchestrator:    '#FF6400',
+  promptWriter:    '#00ccff',
+  fileAnalyst:     '#6699ff',
+  checker:         '#ffcc00',
+  statusAgent:     '#aaaaaa',
+  kiro:            '#00ff88',
+  tui:             '#ffffff',
+  all:             '#888888',
+  mistakePrompter: '#ff4466',
+  responseAnalyst: '#cc88ff',
 };
 
 const AGENT_LABEL = {
-  orchestrator: 'Orchestrator',
-  promptWriter:  'PromptWriter',
-  fileAnalyst:   'FileAnalyst',
-  checker:       'Checker',
-  statusAgent:   'StatusAgent',
-  kiro:          'Kiro',
-  tui:           'TUI',
-  all:           'ALL',
+  orchestrator:    'Orchestrator',
+  promptWriter:    'PromptWriter',
+  fileAnalyst:     'FileAnalyst',
+  checker:         'Checker',
+  statusAgent:     'StatusAgent',
+  kiro:            'Kiro',
+  tui:             'TUI',
+  all:             'ALL',
+  mistakePrompter: 'MistakePrompter',
+  responseAnalyst: 'ResponseAnalyst',
 };
 
 const LOBSTER = [
@@ -254,7 +260,11 @@ function AgentCommsPanel({ entries, scrollOffset, height }) {
   const start = Math.max(0, entries.length - height - scrollOffset);
   const visible = entries.slice(start, start + height);
 
+  // Find the most recent kiroState entry to show above the panel
+  const lastKiroState = [...entries].reverse().find(e => e.type === 'kiroState');
+
   return h(Box, { flexDirection: 'column', height, overflow: 'hidden' },
+    lastKiroState && h(Text, { color: '#00ff88', bold: true }, 'Kiro: ' + lastKiroState.msg),
     visible.length === 0
       ? h(Text, { dimColor: true }, '  Waiting for agents...')
       : visible.map((e, i) => {
@@ -325,6 +335,7 @@ function App() {
   useEffect(() => {
     if (phase !== 'init') return;
     ensureBridgeInstalled();
+    spawnDaemons();
     const token = getConfig('notion_token');
     if (token) { initNotion(token); setPhase('loading_docs'); }
     else setPhase('token');
@@ -387,6 +398,11 @@ function App() {
   const canDown = scrollOffset > 0;
   const borderColor = phase === 'done' ? 'green' : phase === 'error' ? 'red' : ORANGE;
 
+  // Reserve ~36 cols for the preview panel if terminal is wide enough
+  const showPreview = termWidth >= 120;
+  const previewCols = showPreview ? 52 : 0;
+  const commsWidth  = termWidth - previewCols - 8; // 8 = borders + padding
+
   return h(Box, {
     flexDirection: 'column',
     borderStyle: 'round',
@@ -404,9 +420,19 @@ function App() {
     h(Box, { marginBottom: 1 },
       h(Text, { color: ORANGE, dimColor: true }, '-'.repeat(Math.min(innerWidth, 64)))
     ),
-    canUp   && h(Text, { color: ORANGE, dimColor: true }, '  ^ older messages'),
-    h(AgentCommsPanel, { entries: log, scrollOffset, height: panelH }),
-    canDown && h(Text, { color: ORANGE, dimColor: true }, '  v newer messages'),
+    // Main content row: agent comms + live preview side by side
+    h(Box, { flexDirection: 'row', flexGrow: 1 },
+      // Left: agent comms panel
+      h(Box, { flexDirection: 'column', width: commsWidth },
+        canUp   && h(Text, { color: ORANGE, dimColor: true }, '  ^ older messages'),
+        h(AgentCommsPanel, { entries: log, scrollOffset, height: panelH }),
+        canDown && h(Text, { color: ORANGE, dimColor: true }, '  v newer messages'),
+      ),
+      // Right: live screen preview (only if terminal wide enough)
+      showPreview && h(Box, { marginLeft: 2 },
+        h(ScreenPreview, { widthCols: previewCols, heightRows: panelH }),
+      ),
+    ),
     phase === 'done' && h(Box, { marginTop: 1 },
       h(Text, { color: 'green', bold: true }, 'v Build complete -> ' + projectPath)
     ),

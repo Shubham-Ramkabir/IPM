@@ -4,6 +4,7 @@
   "displayName": "IPM IDE Bridge",
   "description": "Receives prompts from IPM CLI and forwards them to the IDE agent",
   "version": "1.0.0",
+  "type": "module",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],
   "activationEvents": ["onStartupFinished"],

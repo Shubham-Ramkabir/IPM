@@ -12,11 +12,17 @@ const { execSync, exec } = require('child_process');
 
 const SOCK_PATH = path.join(os.homedir(), '.ipm', 'ide.sock');
 const DATA_DIR = path.join(os.homedir(), '.ipm');
+const KIRO_STATE_PATH = path.join(os.homedir(), '.ipm', 'kiro_state.json');
+const TERMINAL_SNAPSHOT_PATH = path.join(os.homedir(), '.ipm', 'terminal_snapshot.txt');
 
 let server;
 let outputChannel;
 let lastKiroActivity = 'idle';
 let lastKiroActivityTime = Date.now();
+
+// StatePoller in-memory state
+let currentKiroState = { state: 'idle', since: Date.now(), lastResponseText: '' };
+let stateChangedAt = Date.now();
 
 function activate(context) {
   outputChannel = vscode.window.createOutputChannel('IPM Bridge');
@@ -40,6 +46,8 @@ function activate(context) {
     const readyFile = path.join(DATA_DIR, 'bridge.ready');
     if (fs.existsSync(readyFile)) fs.unlinkSync(readyFile);
   }});
+
+  startStatePoller();
 }
 
 function handleConnection(socket) {
@@ -118,12 +126,416 @@ async function handleMessage(msg, socket) {
         break;
       }
 
+      case 'get_kiro_state': {
+        const kiroState = readKiroStateFile();
+        reply({ ok: true, state: kiroState.state, since: kiroState.since, lastResponseText: kiroState.lastResponseText });
+        break;
+      }
+
+      case 'handle_ui_interaction': {
+        const result = await handleUiInteraction();
+        reply({ ok: result.ok, action: result.action });
+        break;
+      }
+
+      case 'get_last_response': {
+        const stateForResponse = readKiroStateFile();
+        reply({ ok: true, text: stateForResponse.lastResponseText });
+        break;
+      }
+
       default:
         reply({ ok: false, error: `Unknown message type: ${msg.type}` });
     }
   } catch (err) {
     reply({ ok: false, error: err.message });
   }
+}
+
+// ── StatePoller ───────────────────────────────────────────────────────────────
+
+const VALID_KIRO_STATES = ['writing', 'thinking', 'waiting_for_input', 'idle'];
+
+async function classifyKiroState(screenshotFile) {
+  try {
+    const apiKey = readGroqApiKey();
+    if (!apiKey) throw new Error('GROQ_API_KEY not found');
+
+    const imageData = fs.readFileSync(screenshotFile);
+    const base64Image = imageData.toString('base64');
+
+    const body = JSON.stringify({
+      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'This is a screenshot of the Kiro IDE chat panel. Classify the current state of the AI assistant. Reply with ONLY one of these exact strings — no explanation, no punctuation, no extra text:\n- writing (if text is actively streaming/appearing in the chat)\n- thinking (if a spinner or loading indicator is visible but no new text)\n- waiting_for_input (if a button or interactive element is visible awaiting user action)\n- idle (if none of the above)',
+            },
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/png;base64,${base64Image}` },
+            },
+          ],
+        },
+      ],
+      temperature: 0.1,
+      max_tokens: 16,
+    });
+
+    const responseText = await groqHttpRequest(body, apiKey);
+    const classified = responseText.trim().toLowerCase();
+    if (VALID_KIRO_STATES.includes(classified)) return classified;
+
+    // If the model returned something unexpected, default to idle
+    outputChannel.appendLine(`classifyKiroState: unexpected response "${classified}", defaulting to idle`);
+    return 'idle';
+  } catch (e) {
+    outputChannel.appendLine('classifyKiroState error: ' + e.message);
+    // Return previous known state as fallback
+    return currentKiroState.state;
+  }
+}
+
+async function captureLastResponse(screenshotFile) {
+  try {
+    const apiKey = readGroqApiKey();
+    if (!apiKey) throw new Error('GROQ_API_KEY not found');
+
+    const imageData = fs.readFileSync(screenshotFile);
+    const base64Image = imageData.toString('base64');
+
+    const body = JSON.stringify({
+      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'This is a screenshot of the Kiro IDE chat panel. Extract and return the full visible text of the AI assistant\'s most recent (last) response message. Return ONLY the text content of that response — no labels, no formatting, no explanation. If no response is visible, return an empty string.',
+            },
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/png;base64,${base64Image}` },
+            },
+          ],
+        },
+      ],
+      temperature: 0.1,
+      max_tokens: 2048,
+    });
+
+    return await groqHttpRequest(body, apiKey);
+  } catch (e) {
+    outputChannel.appendLine('captureLastResponse error: ' + e.message);
+    return '';
+  }
+}
+
+async function captureTerminalText() {
+  try {
+    // First try AppleScript to read terminal content from Kiro's integrated terminal
+    const script = `
+tell application "System Events"
+  tell process "Electron"
+    set frontmost to true
+    delay 0.2
+  end tell
+end tell
+-- Use screencapture to get terminal area, then fall back to clipboard method
+do shell script "echo ''"`;
+
+    // Attempt to get terminal text via AppleScript clipboard trick
+    const clipboardScript = `
+tell application "System Events"
+  tell process "Electron"
+    -- Focus the terminal panel and select all text
+    keystroke "j" using {command down}
+    delay 0.3
+    keystroke "a" using {command down}
+    delay 0.1
+    keystroke "c" using {command down}
+    delay 0.2
+  end tell
+end tell
+return the clipboard`;
+
+    try {
+      const terminalText = execSync(`osascript -e '${clipboardScript.replace(/'/g, "'\\''")}'`, {
+        timeout: 5000,
+      }).toString().trim();
+      if (terminalText) return terminalText;
+    } catch {
+      // AppleScript approach failed, fall through to vision
+    }
+
+    // Fallback: take a screenshot and use GroqVision to extract terminal text
+    const screenshotFile = path.join(DATA_DIR, 'kiro_terminal.png');
+    execSync(`screencapture -x "${screenshotFile}"`);
+    await sleep(100);
+
+    const apiKey = readGroqApiKey();
+    if (!apiKey) return '';
+
+    const imageData = fs.readFileSync(screenshotFile);
+    const base64Image = imageData.toString('base64');
+
+    const body = JSON.stringify({
+      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'This is a screenshot of the Kiro IDE. Extract and return the full visible text content from the integrated terminal panel (the bottom panel showing command output). Return ONLY the terminal text — no explanation. If no terminal is visible, return an empty string.',
+            },
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/png;base64,${base64Image}` },
+            },
+          ],
+        },
+      ],
+      temperature: 0.1,
+      max_tokens: 2048,
+    });
+
+    return await groqHttpRequest(body, apiKey);
+  } catch (e) {
+    outputChannel.appendLine('captureTerminalText error: ' + e.message);
+    return '';
+  }
+}
+
+function startStatePoller() {
+  setInterval(async () => {
+    try {
+      const screenshotFile = path.join(DATA_DIR, 'kiro_screen.png');
+      execSync(`screencapture -x "${screenshotFile}"`);
+      await sleep(100);
+
+      const newState = await classifyKiroState(screenshotFile);
+      const prevState = currentKiroState.state;
+
+      if (newState !== prevState) {
+        stateChangedAt = Date.now();
+      }
+
+      // Capture last response text on idle transition
+      let lastResponseText = currentKiroState.lastResponseText;
+      if (newState === 'idle' && prevState !== 'idle') {
+        lastResponseText = await captureLastResponse(screenshotFile);
+      }
+
+      currentKiroState = { state: newState, since: stateChangedAt, lastResponseText };
+
+      // Write kiro_state.json
+      try {
+        fs.writeFileSync(KIRO_STATE_PATH, JSON.stringify(currentKiroState));
+      } catch (e) {
+        outputChannel.appendLine('startStatePoller: failed to write kiro_state.json: ' + e.message);
+      }
+
+      // Capture terminal text and write snapshot
+      const terminalText = await captureTerminalText();
+      try {
+        fs.writeFileSync(TERMINAL_SNAPSHOT_PATH, terminalText);
+      } catch (e) {
+        outputChannel.appendLine('startStatePoller: failed to write terminal_snapshot.txt: ' + e.message);
+      }
+    } catch (e) {
+      outputChannel.appendLine('startStatePoller tick error: ' + e.message);
+    }
+  }, 500);
+}
+
+// ── UIInteractor ──────────────────────────────────────────────────────────────
+
+/**
+ * Use GroqVision to identify all visible interactive elements in a screenshot.
+ * Returns an array of { label, x, y, recommended } objects.
+ * Returns empty array on failure.
+ */
+async function detectInteractiveElements(screenshotFile) {
+  try {
+    const apiKey = readGroqApiKey();
+    if (!apiKey) throw new Error('GROQ_API_KEY not found');
+
+    const imageData = fs.readFileSync(screenshotFile);
+    const base64Image = imageData.toString('base64');
+
+    const body = JSON.stringify({
+      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'This is a screenshot of the Kiro IDE. Identify ALL visible interactive elements (buttons, options, checkboxes, links, etc.) that are awaiting user action. For each element return a JSON array where each item has: "label" (text on the element), "x" (center pixel x coordinate), "y" (center pixel y coordinate), "recommended" (true if the element is highlighted, labelled "Recommended", or visually emphasised as the preferred choice, otherwise false). Return ONLY the JSON array — no explanation, no markdown fences. Example: [{"label":"Accept","x":800,"y":600,"recommended":true},{"label":"Dismiss","x":900,"y":600,"recommended":false}]. If no interactive elements are visible, return [].',
+            },
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/png;base64,${base64Image}` },
+            },
+          ],
+        },
+      ],
+      temperature: 0.1,
+      max_tokens: 512,
+    });
+
+    const responseText = await groqHttpRequest(body, apiKey);
+
+    // Extract JSON array from response
+    const match = responseText.match(/\[[\s\S]*\]/);
+    if (!match) {
+      outputChannel.appendLine('detectInteractiveElements: no JSON array in response: ' + responseText.slice(0, 100));
+      return [];
+    }
+
+    const elements = JSON.parse(match[0]);
+    if (!Array.isArray(elements)) return [];
+
+    // Normalise each element to ensure required fields
+    return elements.map(el => ({
+      label: String(el.label ?? ''),
+      x: Number(el.x ?? 0),
+      y: Number(el.y ?? 0),
+      recommended: Boolean(el.recommended),
+    }));
+  } catch (e) {
+    outputChannel.appendLine('detectInteractiveElements error: ' + e.message);
+    return [];
+  }
+}
+
+/**
+ * Pick the best target from a list of interactive elements.
+ * Returns the recommended element if one exists, otherwise the first element.
+ * Returns null if the array is empty.
+ */
+function pickTarget(elements) {
+  if (!elements || elements.length === 0) return null;
+  const recommended = elements.find(el => el.recommended === true);
+  return recommended ?? elements[0];
+}
+
+/**
+ * Click at the given screen coordinates using AppleScript.
+ */
+async function clickViaAppleScript(x, y) {
+  const script = `tell application "System Events" to tell process "Electron" to click at {${x}, ${y}}`;
+  execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, { timeout: 5000 });
+}
+
+/**
+ * Handle a UI interaction: take screenshot → detect elements → pick target →
+ * click → wait 800 ms → re-read state file.
+ * Retries up to 3 times if state remains waiting_for_input.
+ * Returns { ok: boolean, action: string }.
+ */
+async function handleUiInteraction() {
+  const MAX_ATTEMPTS = 3;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      // Take screenshot
+      const screenshotFile = path.join(DATA_DIR, 'kiro_ui.png');
+      execSync(`screencapture -x "${screenshotFile}"`);
+      await sleep(100);
+
+      // Detect interactive elements
+      const elements = await detectInteractiveElements(screenshotFile);
+
+      if (elements.length === 0) {
+        outputChannel.appendLine(`handleUiInteraction attempt ${attempt}: no interactive elements detected`);
+        await sleep(800);
+        const state = readKiroStateFile();
+        if (state.state !== 'waiting_for_input') {
+          return { ok: true, action: 'No elements detected but state cleared' };
+        }
+        continue;
+      }
+
+      // Pick target
+      const target = pickTarget(elements);
+      outputChannel.appendLine(`handleUiInteraction attempt ${attempt}: clicking "${target.label}" at (${target.x}, ${target.y})`);
+
+      // Click via AppleScript
+      await clickViaAppleScript(target.x, target.y);
+
+      // Wait and re-check state
+      await sleep(800);
+      const newState = readKiroStateFile();
+
+      if (newState.state !== 'waiting_for_input') {
+        const action = `Clicked: ${target.label}`;
+        outputChannel.appendLine(`handleUiInteraction: success — ${action}`);
+        return { ok: true, action };
+      }
+
+      outputChannel.appendLine(`handleUiInteraction attempt ${attempt}: state still waiting_for_input after click`);
+    } catch (e) {
+      outputChannel.appendLine(`handleUiInteraction attempt ${attempt} error: ${e.message}`);
+    }
+  }
+
+  // All 3 attempts failed
+  outputChannel.appendLine('handleUiInteraction: ui_stuck after 3 attempts');
+  return { ok: false, action: 'ui_stuck' };
+}
+
+/**
+ * Read the current KiroState from the state file, falling back to in-memory state.
+ */
+function readKiroStateFile() {
+  try {
+    const raw = fs.readFileSync(KIRO_STATE_PATH, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return currentKiroState;
+  }
+}
+
+// ── Shared Groq HTTP helper ───────────────────────────────────────────────────
+
+function groqHttpRequest(body, apiKey) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.groq.com',
+      path: '/openai/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed.choices?.[0]?.message?.content ?? '';
+          resolve(content.trim());
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Groq API timeout')); });
+    req.write(body);
+    req.end();
+  });
 }
 
 // ── Vision-guided prompt injection ───────────────────────────────────────────
@@ -180,7 +592,6 @@ end tell`;
 
 function findInputBarCoords(screenshotFile) {
   return new Promise((resolve, reject) => {
-    // Read .env for API key (extension runs in a different env than the CLI)
     const apiKey = readGroqApiKey();
     if (!apiKey) return reject(new Error('GROQ_API_KEY not found'));
 
@@ -208,37 +619,11 @@ function findInputBarCoords(screenshotFile) {
       max_tokens: 64,
     });
 
-    const options = {
-      hostname: 'api.groq.com',
-      path: '/openai/v1/chat/completions',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Length': Buffer.byteLength(body),
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => { data += chunk; });
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          const content = parsed.choices?.[0]?.message?.content ?? '';
-          const match = content.match(/\{[^}]*"x"\s*:\s*(\d+)[^}]*"y"\s*:\s*(\d+)[^}]*\}/);
-          if (!match) throw new Error('No coords in response: ' + content.slice(0, 100));
-          resolve({ x: parseInt(match[1]), y: parseInt(match[2]) });
-        } catch (e) {
-          reject(e);
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Vision API timeout')); });
-    req.write(body);
-    req.end();
+    groqHttpRequest(body, apiKey).then(content => {
+      const match = content.match(/\{[^}]*"x"\s*:\s*(\d+)[^}]*"y"\s*:\s*(\d+)[^}]*\}/);
+      if (!match) throw new Error('No coords in response: ' + content.slice(0, 100));
+      resolve({ x: parseInt(match[1]), y: parseInt(match[2]) });
+    }).catch(reject);
   });
 }
 

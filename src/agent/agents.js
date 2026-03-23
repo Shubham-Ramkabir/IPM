@@ -35,6 +35,10 @@ async function getModels() {
     statusAgent:   pick('llama-3.1-8b-instant', 'llama-3.3-70b-versatile'),
     // Quality checks + inter-agent arbitration
     checker:       pick('groq/compound', 'moonshotai/kimi-k2-instruct', 'llama-3.3-70b-versatile'),
+    // Response reading + next-prompt approval
+    responseAnalyst: pick('moonshotai/kimi-k2-instruct', 'llama-3.3-70b-versatile'),
+    // Error detection + correction prompt generation
+    mistakePrompter: pick('llama-3.3-70b-versatile'),
   };
 
   return _models;
@@ -277,4 +281,163 @@ Max 70 characters. Output ONLY the status line — no quotes, no punctuation at 
 // ── Export model info for TUI display ────────────────────────────────────────
 export async function getModelAssignments() {
   return getModels();
+}
+
+// ── Agent: MistakePrompter ────────────────────────────────────────────────────
+// Reads Kiro's last response and identifies errors, generating a correction prompt.
+// Called after every idle transition, after ResponseAnalyst has captured the response.
+export async function mistakePrompterAgent({ step, terminalSnapshot, fileChangeLog, lastResponseText, bus }) {
+  const models = await getModels();
+
+  let raw;
+  try {
+    raw = await callAgent({
+      model: models.mistakePrompter,
+      systemPrompt: `You are the IPM MistakePrompter. You analyse Kiro's last response and identify any errors or problems.
+
+Output ONLY valid JSON — no markdown, no explanation:
+{
+  "hasError": boolean,
+  "errorSummary": "brief description of the error, or empty string if no error",
+  "correctionPrompt": "the prompt to send to Kiro to fix the error, or empty string if no error"
+}`,
+      userPrompt: `Step: ${step}
+
+Terminal snapshot:
+${truncate(terminalSnapshot, 2000)}
+
+Recent file changes (last 20):
+${JSON.stringify(fileChangeLog?.slice(-20) ?? [], null, 2)}
+
+Kiro's last response:
+${truncate(lastResponseText, 3000)}`,
+      temperature: 0.2,
+    });
+  } catch (err) {
+    console.error('[mistakePrompterAgent] LLM call failed:', err.message);
+    bus.post('mistakePrompter', 'orchestrator', 'no_error', 'LLM error — skipping error check');
+    return { hasError: false, errorSummary: '', correctionPrompt: '' };
+  }
+
+  let parsed;
+  try {
+    const match = raw.match(/\{[\s\S]*\}/);
+    parsed = JSON.parse(match ? match[0] : raw);
+  } catch {
+    console.error('[mistakePrompterAgent] Malformed JSON:', raw.slice(0, 200));
+    bus.post('mistakePrompter', 'orchestrator', 'no_error', 'Malformed JSON — skipping error check');
+    return { hasError: false, errorSummary: '', correctionPrompt: '' };
+  }
+
+  if (parsed.hasError) {
+    bus.post('mistakePrompter', 'orchestrator', 'error', `${parsed.errorSummary}`);
+    bus.post('mistakePrompter', 'kiro', 'correction', parsed.correctionPrompt);
+  } else {
+    bus.post('mistakePrompter', 'orchestrator', 'no_error', 'No errors detected');
+  }
+
+  return {
+    hasError:         Boolean(parsed.hasError),
+    errorSummary:     typeof parsed.errorSummary === 'string'     ? parsed.errorSummary     : '',
+    correctionPrompt: typeof parsed.correctionPrompt === 'string' ? parsed.correctionPrompt : '',
+  };
+}
+
+// ── Agent: ResponseAnalyst ────────────────────────────────────────────────────
+// Reads Kiro's last response and writes the next prompt.
+// Gates every outgoing prompt — no prompt is sent unless this agent approves it.
+// Up to 3 retries on approved:false; after that falls back to PromptWriter.
+export async function responseAnalystAgent({ lastResponseText, step, fileChangeLog, terminalSnapshot, busContext, bus }) {
+  const models = await getModels();
+
+  let retries = 0;
+  const MAX_RETRIES = 3;
+
+  while (retries < MAX_RETRIES) {
+    let raw;
+    try {
+      raw = await callAgent({
+        model: models.responseAnalyst,
+        systemPrompt: `You are the IPM ResponseAnalyst. You read Kiro's last response and decide whether the next prompt should be sent.
+
+Output ONLY valid JSON — no markdown, no explanation:
+{
+  "approved": boolean,
+  "nextPrompt": "the refined prompt to send next, or empty string if not approved",
+  "reasoning": "brief explanation of your decision"
+}
+
+Context from other agents:
+${truncate(busContext ?? '', 1000)}`,
+        userPrompt: `Step: ${step}
+
+Terminal snapshot:
+${truncate(terminalSnapshot, 2000)}
+
+Recent file changes (last 20):
+${JSON.stringify(fileChangeLog?.slice(-20) ?? [], null, 2)}
+
+Kiro's last response:
+${truncate(lastResponseText, 3000)}`,
+        temperature: 0.25,
+      });
+    } catch (err) {
+      retries++;
+      console.error(`[responseAnalystAgent] LLM call failed (attempt ${retries}):`, err.message);
+      if (retries >= MAX_RETRIES) {
+        console.warn('[responseAnalystAgent] Max retries reached — triggering PromptWriter fallback');
+        bus.post('responseAnalyst', 'orchestrator', 'fallback', 'Max retries reached — using PromptWriter fallback');
+        // Trigger PromptWriter fallback: return approved:true with a basic prompt
+        const fallbackPrompt = await promptWriterAgent({
+          step,
+          stepIndex: 0,
+          totalSteps: 1,
+          projectName: 'project',
+          fileTree: [],
+          bus,
+        });
+        return { approved: true, nextPrompt: fallbackPrompt, reasoning: 'PromptWriter fallback after 3 LLM errors' };
+      }
+      continue;
+    }
+
+    let parsed;
+    try {
+      const match = raw.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(match ? match[0] : raw);
+    } catch {
+      console.error('[responseAnalystAgent] Malformed JSON:', raw.slice(0, 200));
+      parsed = { approved: false, nextPrompt: '', reasoning: raw.slice(0, 200) };
+    }
+
+    const result = {
+      approved:   Boolean(parsed.approved),
+      nextPrompt: typeof parsed.nextPrompt === 'string' ? parsed.nextPrompt : '',
+      reasoning:  typeof parsed.reasoning  === 'string' ? parsed.reasoning  : '',
+    };
+
+    if (result.approved) {
+      bus.post('responseAnalyst', 'kiro', 'nextPrompt', result.nextPrompt);
+      return result;
+    } else {
+      retries++;
+      bus.post('responseAnalyst', 'orchestrator', 'reasoning', result.reasoning);
+      if (retries >= MAX_RETRIES) {
+        console.warn('[responseAnalystAgent] Max retries reached — triggering PromptWriter fallback');
+        bus.post('responseAnalyst', 'orchestrator', 'fallback', 'Max retries reached — using PromptWriter fallback');
+        const fallbackPrompt = await promptWriterAgent({
+          step,
+          stepIndex: 0,
+          totalSteps: 1,
+          projectName: 'project',
+          fileTree: [],
+          bus,
+        });
+        return { approved: true, nextPrompt: fallbackPrompt, reasoning: 'PromptWriter fallback after 3 unapproved responses' };
+      }
+    }
+  }
+
+  // Should never reach here, but safety net
+  return { approved: false, nextPrompt: '', reasoning: 'Unexpected exit from retry loop' };
 }

@@ -3,7 +3,8 @@ import os from 'os';
 import fs from 'fs';
 import chokidar from 'chokidar';
 import { readPage } from './notion.js';
-import { openFolder, sendPrompt, listFiles, waitForBridge, pollKiroStatus } from './ide.js';
+import { openFolder, sendPrompt, listFiles, waitForBridge, waitForVision, pollKiroState, getLastResponse, readTerminalSnapshot } from './ide.js';
+import { sendCursorPrompt, openInCursor, pollCursorState } from './cursor.js';
 import { saveRun, updateRunStatus } from '../db/index.js';
 import {
   MessageBus,
@@ -12,6 +13,8 @@ import {
   fileAnalystAgent,
   checkerAgent,
   statusAgent,
+  responseAnalystAgent,
+  mistakePrompterAgent,
   getModelAssignments,
 } from './agents.js';
 
@@ -30,11 +33,13 @@ function busEntryToLog(entry) {
     check:    entry.content.startsWith('✓') ? 'done' : 'error',
   };
   const icon = {
-    orchestrator: '🧠',
-    promptWriter:  '✍',
-    fileAnalyst:   '📄',
-    checker:       '🔍',
-    statusAgent:   '·',
+    orchestrator:    '🧠',
+    promptWriter:    '✍',
+    fileAnalyst:     '📄',
+    checker:         '🔍',
+    statusAgent:     '·',
+    responseAnalyst: '🔬',
+    mistakePrompter: '⚠',
   };
   const ic = icon[entry.from] || '·';
   return {
@@ -43,7 +48,7 @@ function busEntryToLog(entry) {
   };
 }
 
-export async function runBuild({ docId, docTitle, onStatus, onBusMessage, onDone, onError }) {
+export async function runBuild({ docId, docTitle, ide = 'kiro', onStatus, onBusMessage, onDone, onError }) {
   const log = (msg, type = 'info') => onStatus({ msg, type });
 
   // Bus messages go to onBusMessage (rendered as agent comms in TUI)
@@ -71,24 +76,55 @@ export async function runBuild({ docId, docTitle, onStatus, onBusMessage, onDone
     log(`📁 Project folder created: ${projectPath}`, 'info');
     const runId = saveRun(docId, docTitle, projectPath);
 
-    // ── 4. Check bridge ─────────────────────────────────────────────────────
-    log('🔌 Connecting to IDE…', 'kiro');
-    const bridgeReady = await waitForBridge(20000, (msg) => log(msg, 'info'));
-    if (!bridgeReady) throw new Error('IDE not connected. Make sure Kiro is open and the IPM Bridge extension is active.');
-    log('✓ IDE connected', 'kiro');
+    // ── 4. Check bridge + vision ────────────────────────────────────────────
+    if (ide === 'kiro') {
+      log('🔌 Connecting to IDE…', 'kiro');
+      const bridgeReady = await waitForBridge(20000, (msg) => log(msg, 'info'));
+      if (!bridgeReady) throw new Error('IDE not connected. Make sure Kiro is open and the IPM Bridge extension is active.');
+      log('✓ IDE connected', 'kiro');
+
+      log('👁 Waiting for vision watcher…', 'kiro');
+      const visionReady = await waitForVision(30000, (msg) => log(msg, 'info'));
+      if (!visionReady) log('⚠ Vision watcher not running — falling back to bridge state polling', 'info');
+      else log('✓ Vision watcher live', 'kiro');
+    } else {
+      log('✓ Using Cursor API — no bridge needed', 'kiro');
+    }
 
     // ── 5. Open project in IDE ─────────────────────────────────────────────
     log('Opening project in IDE…', 'kiro');
-    await openFolder(projectPath);
+    if (ide === 'cursor') await openInCursor(projectPath);
+    else await openFolder(projectPath);
     log('✓ Project opened in IDE', 'kiro');
 
-    // ── 6. File watcher ─────────────────────────────────────────────────────
+    // ── 6. File watcher + fileChangeLog ────────────────────────────────────
+    // Task 7.1: initialise fileChangeLog before the step loop
+    const fileChangeLog = [];
+
     const watcher = chokidar.watch(projectPath, { ignoreInitial: true, ignored: /(^|[/\\])\../ });
     watcher.on('all', (event, filePath) => {
       const rel = path.relative(projectPath, filePath);
       const verb = event === 'add' ? 'created' : event === 'change' ? 'updated' : event === 'unlink' ? 'deleted' : event;
       log(`⚙ IDE ${verb}: ${rel}`, 'kiro');
+
+      // Task 7.1: push change event and keep only last 20 entries
+      fileChangeLog.push({ path: filePath, ts: Date.now(), event });
+      if (fileChangeLog.length > 20) fileChangeLog.splice(0, fileChangeLog.length - 20);
     });
+
+    // ── Helper: IDE-aware send + poll ──────────────────────────────────────
+    const ideSend = async (text) => {
+      if (ide === 'cursor') return sendCursorPrompt(text, projectPath);
+      return sendPrompt(text);
+    };
+    const idePollState = async () => {
+      if (ide === 'cursor') return pollCursorState();
+      return pollKiroState();
+    };
+    const ideGetLastResponse = async () => {
+      if (ide === 'cursor') return (await pollCursorState()).lastResponseText ?? '';
+      return getLastResponse();
+    };
 
     // ── 7. Execute each step with all agents ────────────────────────────────
     for (let i = 0; i < plan.steps.length; i++) {
@@ -101,8 +137,12 @@ export async function runBuild({ docId, docTitle, onStatus, onBusMessage, onDone
       const fileTree = await listFiles(projectPath).catch(() => []);
       if (fileTree.length) log(`Found ${fileTree.length} files`, 'detail');
 
-      // Prompt Writer crafts the exact IDE prompt
+      // Read terminal snapshot for shared context
+      const terminalSnapshot = await readTerminalSnapshot();
+
+      // ── Step 1: PromptWriter → draft prompt ──────────────────────────────
       log(`🧠 Thinking… crafting prompt for IDE`, 'thinking');
+      bus.post('runner', 'promptWriter', 'start', `step ${i}`);
       const kiroPrompt = await promptWriterAgent({
         step,
         stepIndex: i,
@@ -110,28 +150,162 @@ export async function runBuild({ docId, docTitle, onStatus, onBusMessage, onDone
         projectName: plan.projectName,
         fileTree,
         bus,
+        kiroState: null,
+        terminalSnapshot,
+        fileChangeLog: [...fileChangeLog],
       });
+      bus.post('runner', 'promptWriter', 'end', `step ${i}`);
 
-      // Send to IDE
+      // ── Step 2: waitForKiroIdle → ensure idle before sending ─────────────
+      log('⏳ Waiting for Kiro to be idle before sending…', 'kiro');
+      await waitForKiroIdle(log, bus);
+
+      // ── Step 3: ResponseAnalyst → approve/rewrite prompt ─────────────────
+      let approvedPrompt = kiroPrompt;
+      let analystResult;
+      const kiroStateBeforeSend = await idePollState();
+      const terminalSnapshotBeforeSend = await readTerminalSnapshot();
+
+      bus.post('runner', 'responseAnalyst', 'start', `step ${i}`);
+      analystResult = await responseAnalystAgent({
+        lastResponseText: kiroStateBeforeSend.lastResponseText || '',
+        step,
+        fileChangeLog: [...fileChangeLog],
+        terminalSnapshot: terminalSnapshotBeforeSend,
+        busContext: bus.contextFor('responseAnalyst'),
+        bus,
+        kiroState: kiroStateBeforeSend,
+      });
+      bus.post('runner', 'responseAnalyst', 'end', `step ${i}`);
+
+      if (analystResult.approved && analystResult.nextPrompt) {
+        approvedPrompt = analystResult.nextPrompt;
+      } else if (!analystResult.approved) {
+        // Fallback already handled inside responseAnalystAgent (returns approved:true after 3 retries)
+        log('⚠ ResponseAnalyst fallback triggered — using PromptWriter prompt', 'info');
+        approvedPrompt = kiroPrompt;
+      }
+
+      // ── Step 4: sendPrompt → send approved prompt ─────────────────────────
       log('→ Prompting IDE…', 'prompting');
-      await sendPrompt(kiroPrompt);
+      await ideSend(approvedPrompt);
       log('✓ Prompt sent to IDE', 'prompting');
 
-      // Poll IDE status while it works
+      // ── Step 5: waitForKiroIdle → wait for Kiro to finish ────────────────
       log('⚙ IDE is building…', 'kiro');
-      await waitForKiroWithStatus(watcher, 8000, log);
+      await waitForKiroIdle(log, bus);
 
-      // File Analyst reviews what was built
+      // ── Step 6: getLastResponse → capture response text ──────────────────
+      const lastResponseText = await ideGetLastResponse();
+      const terminalSnapshotAfter = await readTerminalSnapshot();
+      const kiroStateAfter = await idePollState();
+
+      // ── Step 7: ResponseAnalyst → read response, write next-step context ─
+      bus.post('runner', 'responseAnalyst', 'start', `step ${i} post-response`);
+      await responseAnalystAgent({
+        lastResponseText,
+        step,
+        fileChangeLog: [...fileChangeLog],
+        terminalSnapshot: terminalSnapshotAfter,
+        busContext: bus.contextFor('responseAnalyst'),
+        bus,
+        kiroState: kiroStateAfter,
+      });
+      bus.post('runner', 'responseAnalyst', 'end', `step ${i} post-response`);
+
+      // ── Step 8: MistakePrompter → check for errors ────────────────────────
+      bus.post('runner', 'mistakePrompter', 'start', `step ${i}`);
+      const mistakeResult = await mistakePrompterAgent({
+        step,
+        terminalSnapshot: terminalSnapshotAfter,
+        fileChangeLog: [...fileChangeLog],
+        lastResponseText,
+        bus,
+        kiroState: kiroStateAfter,
+      });
+      bus.post('runner', 'mistakePrompter', 'end', `step ${i}`);
+
+      if (mistakeResult.hasError) {
+        log(`⚠ Error detected: ${mistakeResult.errorSummary}`, 'error');
+
+        // Sub-step: ResponseAnalyst → approve correction prompt
+        const correctionKiroState = await idePollState();
+        const correctionTerminal = await readTerminalSnapshot();
+
+        bus.post('runner', 'responseAnalyst', 'start', `step ${i} correction`);
+        const correctionAnalyst = await responseAnalystAgent({
+          lastResponseText,
+          step: mistakeResult.correctionPrompt,
+          fileChangeLog: [...fileChangeLog],
+          terminalSnapshot: correctionTerminal,
+          busContext: bus.contextFor('responseAnalyst'),
+          bus,
+          kiroState: correctionKiroState,
+        });
+        bus.post('runner', 'responseAnalyst', 'end', `step ${i} correction`);
+
+        const correctionPromptToSend = correctionAnalyst.approved && correctionAnalyst.nextPrompt
+          ? correctionAnalyst.nextPrompt
+          : mistakeResult.correctionPrompt;
+
+        // Sub-step: sendPrompt → send correction
+        await ideSend(correctionPromptToSend);
+        log('✓ Correction prompt sent', 'prompting');
+
+        // Sub-step: waitForKiroIdle
+        await waitForKiroIdle(log, bus);
+
+        // Sub-step: MistakePrompter re-check (once)
+        const recheckLastResponse = await ideGetLastResponse();
+        const recheckTerminal = await readTerminalSnapshot();
+        const recheckKiroState = await idePollState();
+
+        bus.post('runner', 'mistakePrompter', 'start', `step ${i} recheck`);
+        await mistakePrompterAgent({
+          step,
+          terminalSnapshot: recheckTerminal,
+          fileChangeLog: [...fileChangeLog],
+          lastResponseText: recheckLastResponse,
+          bus,
+          kiroState: recheckKiroState,
+        });
+        bus.post('runner', 'mistakePrompter', 'end', `step ${i} recheck`);
+      }
+
+      // ── Step 9: FileAnalyst → review file tree + terminal + change log ───
       const updatedTree = await listFiles(projectPath).catch(() => []);
-      log(`📄 Reading files… reviewing ${updatedTree.length} files`, 'reading');      const analysis = await fileAnalystAgent({
+      const fileAnalystTerminal = await readTerminalSnapshot();
+      const fileAnalystKiroState = await idePollState();
+
+      log(`📄 Reading files… reviewing ${updatedTree.length} files`, 'reading');
+      bus.post('runner', 'fileAnalyst', 'start', `step ${i}`);
+      const analysis = await fileAnalystAgent({
         fileTree: updatedTree,
         projectName: plan.projectName,
         expectedStep: step,
         bus,
+        terminalSnapshot: fileAnalystTerminal,
+        fileChangeLog: [...fileChangeLog],
+        kiroState: fileAnalystKiroState,
       });
+      bus.post('runner', 'fileAnalyst', 'end', `step ${i}`);
 
-      // Checker validates the step
-      log('🔍 Checking build quality…', 'info');      const check = await checkerAgent({ step, fileTree: updatedTree, analysis, bus });
+      // ── Step 10: Checker → quality gate (retry logic unchanged) ──────────
+      log('🔍 Checking build quality…', 'info');
+      const checkerKiroState = await idePollState();
+      const checkerTerminal = await readTerminalSnapshot();
+
+      bus.post('runner', 'checker', 'start', `step ${i}`);
+      const check = await checkerAgent({
+        step,
+        fileTree: updatedTree,
+        analysis,
+        bus,
+        kiroState: checkerKiroState,
+        terminalSnapshot: checkerTerminal,
+        fileChangeLog: [...fileChangeLog],
+      });
+      bus.post('runner', 'checker', 'end', `step ${i}`);
 
       if (!check.passed && check.retry) {
         log(`↩ Step ${i + 1} needs retry: ${check.reason}`, 'error');
@@ -139,11 +313,20 @@ export async function runBuild({ docId, docTitle, onStatus, onBusMessage, onDone
         continue;
       }
 
-      // Status agent gives a human summary
+      // ── Step 11: StatusAgent → TUI summary ───────────────────────────────
+      const statusKiroState = await idePollState();
+      const statusTerminal = await readTerminalSnapshot();
+
+      bus.post('runner', 'statusAgent', 'start', `step ${i}`);
       const statusLine = await statusAgent({
         context: `Step ${i+1} done. Analysis: ${analysis.summary}. Check: ${check.reason}`,
         bus,
+        kiroState: statusKiroState,
+        terminalSnapshot: statusTerminal,
+        fileChangeLog: [...fileChangeLog],
       });
+      bus.post('runner', 'statusAgent', 'end', `step ${i}`);
+
       log(statusLine, check.passed ? 'done' : 'info');
     }
 
@@ -158,43 +341,63 @@ export async function runBuild({ docId, docTitle, onStatus, onBusMessage, onDone
   }
 }
 
-// Wait until no file changes for idleMs, showing live IDE status in the log
-async function waitForKiroWithStatus(watcher, idleMs, log) {
-  const KIRO_MESSAGES = [
-    'IDE is building…',
-    'IDE is writing code…',
-    'IDE is thinking…',
-    'IDE is generating files…',
-    'IDE is working…',
-  ];
-  let msgIdx = 0;
+// Task 7.3: waitForKiroIdle — replaces waitForKiroWithStatus
+// Poll pollKiroState() every 500ms; handle waiting_for_input; return on idle ≥ 1500ms; timeout at 10 min
+export async function waitForKiroIdle(log, bus) {
+  const POLL_INTERVAL = 500;
+  const IDLE_STABILISE_MS = 1500;
+  const TIMEOUT_MS = 10 * 60 * 1000;
+  const STATUS_INTERVAL_MS = 3000;
+  const KNOWN_KIRO_STATES = ['writing', 'thinking', 'waiting_for_input', 'idle'];
 
-  return new Promise(resolve => {
-    let lastChange = Date.now();
-    const onChange = () => { lastChange = Date.now(); };
-    watcher.on('all', onChange);
+  const startTime = Date.now();
+  let idleSince = null;
+  let lastStatusEmit = 0;
 
-    // Rotate status messages every 3s so the user sees activity
-    const statusInterval = setInterval(() => {
-      log(`⚙ ${KIRO_MESSAGES[msgIdx % KIRO_MESSAGES.length]}`, 'kiro');
-      msgIdx++;
-    }, 3000);
+  while (true) {
+    const elapsed = Date.now() - startTime;
 
-    const check = setInterval(() => {
-      if (Date.now() - lastChange >= idleMs) {
-        clearInterval(check);
-        clearInterval(statusInterval);
-        watcher.off('all', onChange);
-        resolve();
+    // Timeout guard
+    if (elapsed >= TIMEOUT_MS) {
+      log('⚠ waitForKiroIdle: 10-minute timeout reached — proceeding', 'info');
+      return;
+    }
+
+    const kiroState = await pollKiroState();
+    const now = Date.now();
+
+    // Treat undefined/unknown state as idle to avoid infinite loops
+    const resolvedState = KNOWN_KIRO_STATES.includes(kiroState.state) ? kiroState.state : 'idle';
+
+    // Emit TUI status every 3s
+    if (now - lastStatusEmit >= STATUS_INTERVAL_MS) {
+      bus.post('runner', 'tui', 'kiroState', `Kiro state: ${resolvedState}`);
+      lastStatusEmit = now;
+    }
+
+    if (resolvedState === 'waiting_for_input') {
+      // Trigger UIInteractor via ide.js socket
+      try {
+        const { handleUiInteraction } = await import('./ide.js');
+        const result = await handleUiInteraction();
+        log(`⚙ Kiro UI interaction: ${result.action}`, 'kiro');
+        bus.post('runner', 'kiro', 'kiro', `Clicked: ${result.action}`);
+      } catch {
+        // handleUiInteraction may not be exported yet — fall through
       }
-    }, 500);
+      idleSince = null;
+    } else if (resolvedState === 'idle') {
+      if (idleSince === null) idleSince = now;
+      if (now - idleSince >= IDLE_STABILISE_MS) {
+        return; // stable idle
+      }
+    } else {
+      // writing or thinking — reset idle timer
+      idleSince = null;
+    }
 
-    // Safety timeout: 5 min
-    setTimeout(() => {
-      clearInterval(check);
-      clearInterval(statusInterval);
-      watcher.off('all', onChange);
-      resolve();
-    }, 5 * 60 * 1000);
-  });
+    await sleep(POLL_INTERVAL);
+  }
 }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
