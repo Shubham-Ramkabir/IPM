@@ -8,7 +8,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-const CURSOR_API_KEY = 'crsr_78f9d725f3ef893ca3580339ffa19836a6011193a42044afb00415e5adfa89d2';
+const CURSOR_API_KEY = process.env.CURSOR_API_KEY || '';
 const CURSOR_API_HOST = 'api2.cursor.sh';
 const DATA_DIR = path.join(os.homedir(), '.ipm');
 const CURSOR_STATE_PATH = path.join(DATA_DIR, 'cursor_state.json');
@@ -18,6 +18,10 @@ let currentState = { state: 'idle', since: Date.now(), lastResponseText: '' };
 // ── Send a prompt to Cursor via API ──────────────────────────────────────────
 
 export async function sendCursorPrompt(text, projectPath) {
+  if (!CURSOR_API_KEY) {
+    throw new Error('CURSOR_API_KEY not configured. Set it via web dashboard or .env file.');
+  }
+
   const body = JSON.stringify({
     model: 'claude-sonnet-4-5',
     messages: [{ role: 'user', content: text }],

@@ -16,7 +16,7 @@ import path from 'path';
 import { execSync } from 'child_process';
 
 const FRAME_PATH = path.join(os.homedir(), '.ipm', 'vision_frame.png');
-const STATE_PATH = path.join(os.homedir(), '.ipm', 'kiro_state.json');
+const STATE_PATH = path.join(os.homedir(), '.ipm', 'cursor_state.json');
 const REFRESH_MS = 350;
 
 const STATE_COLOR = {
@@ -76,7 +76,7 @@ function renderChafa(framePath, widthCols, heightRows) {
 
 export function ScreenPreview({ widthCols = 60, heightRows = 20 }) {
   const { stdout } = useStdout();
-  const [kiroState, setKiroState] = useState('idle');
+  const [cursorState, setCursorState] = useState('idle');
   const [frameSeq, setFrameSeq] = useState(0); // increment to trigger re-render
   const [renderMode, setRenderMode] = useState(null); // 'inline' | 'chafa' | 'text'
   const inlineRef = useRef(null);
@@ -94,7 +94,7 @@ export function ScreenPreview({ widthCols = 60, heightRows = 20 }) {
       // Read state
       try {
         const s = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
-        setKiroState(s.state || 'idle');
+        setCursorState(s.state || 'idle');
       } catch {}
 
       // Trigger frame re-render
@@ -123,13 +123,13 @@ export function ScreenPreview({ widthCols = 60, heightRows = 20 }) {
     } catch {}
   }, [frameSeq, renderMode]);
 
-  const stateColor = STATE_COLOR[kiroState] || 'white';
+  const stateColor = STATE_COLOR[cursorState] || 'white';
   const stateLabel = {
     idle:              '● idle',
     writing:           '▶ writing',
     thinking:          '◌ thinking',
     waiting_for_input: '⚡ waiting for input',
-  }[kiroState] || kiroState;
+  }[cursorState] || cursorState;
 
   if (renderMode === 'chafa') {
     let art = '';
@@ -168,7 +168,7 @@ export function ScreenPreview({ widthCols = 60, heightRows = 20 }) {
 
   return h(Box, { flexDirection: 'column', borderStyle: 'round', borderColor: stateColor, width: widthCols + 4, paddingX: 1 },
     h(Box, { justifyContent: 'space-between' },
-      h(Text, { color: '#888' }, 'KIRO STATUS'),
+      h(Text, { color: '#888' }, 'CURSOR STATUS'),
       h(Text, { color: stateColor, bold: true }, stateLabel),
     ),
     lastText

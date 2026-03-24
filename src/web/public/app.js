@@ -2,23 +2,23 @@
 
 // ── Agent metadata ────────────────────────────────────────────────────────────
 const AGENT = {
-  orchestrator:    { color: '#FF6400', label: 'Orchestrator' },
-  promptWriter:    { color: '#38bdf8', label: 'PromptWriter' },
-  fileAnalyst:     { color: '#6699ff', label: 'FileAnalyst' },
-  checker:         { color: '#fbbf24', label: 'Checker' },
-  statusAgent:     { color: '#888',    label: 'Status' },
-  kiro:            { color: '#22c55e', label: 'Kiro' },
-  tui:             { color: '#f2f2f2', label: 'System' },
-  mistakePrompter: { color: '#f87171', label: 'MistakePrompter' },
-  responseAnalyst: { color: '#c084fc', label: 'ResponseAnalyst' },
+  TLI:            { color: '#FF6400', label: 'Agent TLI' },
+  PMC:            { color: '#38bdf8', label: 'Agent PMC' },
+  CRM:            { color: '#22c55e', label: 'Agent CRM' },
+  TSP:            { color: '#fbbf24', label: 'Agent TSP' },
+  DCL:            { color: '#f87171', label: 'Agent DCL' },
+  MNC:            { color: '#c084fc', label: 'Agent MNC' },
+  cursor:         { color: '#22c55e', label: 'Cursor' },
+  tui:            { color: '#f2f2f2', label: 'System' },
+  runner:         { color: '#888',    label: 'Runner' },
 };
 
 const MSG_META = {
   info:      { sender: 'System',    icon: 'icon-cpu' },
-  thinking:  { sender: 'Thinking',  icon: 'icon-loader' },
+  thinking:  { sender: 'Thinking',   icon: 'icon-loader' },
   prompting: { sender: 'Prompting', icon: 'icon-arrow-right' },
-  kiro:      { sender: 'IDE',       icon: 'icon-zap' },
-  reading:   { sender: 'Reading',   icon: 'icon-eye' },
+  cursor:    { sender: 'Cursor',    icon: 'icon-zap' },
+  reading:   { sender: 'Reading',    icon: 'icon-eye' },
   done:      { sender: 'Done',      icon: 'icon-check' },
   error:     { sender: 'Error',     icon: 'icon-x' },
   detail:    { sender: 'Detail',    icon: 'icon-cpu' },
@@ -61,7 +61,7 @@ function applyTheme(light) {
 }
 
 
-let selectedIde = 'kiro';
+let selectedIde = 'cursor';
 let runStartedAt = null;
 let elapsedTimer = null;
 let currentView = 'dashboard';
@@ -243,12 +243,12 @@ $('clear-log').addEventListener('click', () => { $('log').innerHTML = ''; });
 function connectSSE() {
   const es = new EventSource('/events');
 
-  es.addEventListener('log',        e => { const d = JSON.parse(e.data); appendMsg(d.msg, d.type); });
-  es.addEventListener('bus',        e => appendBus(JSON.parse(e.data)));
-  es.addEventListener('kiro_state', e => { const d = JSON.parse(e.data); updateState(d.state, d.lastResponseText); });
-  es.addEventListener('run_start',  e => { const d = JSON.parse(e.data); appendMsg(`Started: ${d.docTitle} via ${d.ide || 'kiro'}`, 'kiro'); });
-  es.addEventListener('run_done',   e => { const d = JSON.parse(e.data); appendMsg(`Build complete → ${d.projectPath}`, 'done'); stopRunUI(); });
-  es.addEventListener('run_error',  e => { const d = JSON.parse(e.data); appendMsg(d.error, 'error'); stopRunUI(); });
+  es.addEventListener('log',          e => { const d = JSON.parse(e.data); appendMsg(d.msg, d.type); });
+  es.addEventListener('bus',           e => appendBus(JSON.parse(e.data)));
+  es.addEventListener('cursor_state',  e => { const d = JSON.parse(e.data); updateState(d.state, d.lastResponseText); });
+  es.addEventListener('run_start',     e => { const d = JSON.parse(e.data); appendMsg(`Started: ${d.docTitle} via ${d.ide || 'cursor'}`, 'cursor'); });
+  es.addEventListener('run_done',      e => { const d = JSON.parse(e.data); appendMsg(`Build complete → ${d.projectPath}`, 'done'); stopRunUI(); });
+  es.addEventListener('run_error',     e => { const d = JSON.parse(e.data); appendMsg(d.error, 'error'); stopRunUI(); });
 
   es.onerror = () => setTimeout(connectSSE, 2000);
 }
@@ -296,11 +296,11 @@ function updateState(state, lastResponseText) {
   $('sidebar-state-text').textContent = label;
 
   // Badges
-  [$('kiro-state-badge'), $('kiro-state-badge-2')].forEach(el => {
+  [$('cursor-state-badge'), $('cursor-state-badge-2')].forEach(el => {
     if (!el) return;
     el.className = `kiro-badge badge-${state}`;
   });
-  [$('kiro-state-text'), $('kiro-state-text-2')].forEach(el => {
+  [$('cursor-state-text'), $('cursor-state-text-2')].forEach(el => {
     if (el) el.textContent = label;
   });
 

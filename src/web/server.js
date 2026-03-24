@@ -1,6 +1,8 @@
 /**
  * IPM Web Server
  * Serves the web dashboard and streams live updates via SSE.
+ * Architecture: TLI → PMC → CRM → TSP → DCL + MNC orchestrator
+ * IDE: Cursor only (Kiro removed)
  * Run with: npm run dev
  */
 
@@ -14,15 +16,13 @@ import * as dotenv from 'dotenv';
 import { getConfig, setConfig } from '../db/index.js';
 import { initNotion, listDocs } from '../agent/notion.js';
 import { runBuild } from '../agent/runner.js';
-import { ensureBridgeInstalled, waitForVision } from '../agent/ide.js';
-import { spawnDaemons } from '../agent/daemons.js';
+import { ensureIDEInstalled, waitForCursor, isCursorReady } from '../agent/ide.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, '../../.env') });
 
 const DATA_DIR = path.join(os.homedir(), '.ipm');
-const FRAME_PATH = path.join(DATA_DIR, 'vision_frame.png');
-const STATE_PATH = path.join(DATA_DIR, 'kiro_state.json');
+const CURSOR_STATE_PATH = path.join(DATA_DIR, 'cursor_state.json');
 const PORT = process.env.IPM_PORT || 3000;
 const ENV_PATH = path.join(__dirname, '../../.env');
 
@@ -43,7 +43,6 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Serve logo
 app.get('/logo.png', (_req, res) => {
   res.sendFile(path.join(__dirname, '../../logo.png'));
 });
@@ -54,8 +53,16 @@ const sseClients = new Set();
 
 function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  const deadClients = new Set();
   for (const res of sseClients) {
-    try { res.write(payload); } catch {}
+    try { 
+      res.write(payload); 
+    } catch (e) {
+      deadClients.add(res);
+    }
+  }
+  for (const dead of deadClients) {
+    sseClients.delete(dead);
   }
 }
 
@@ -64,30 +71,31 @@ app.get('/events', (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
-  sseClients.add(res);
-  req.on('close', () => sseClients.delete(res));
+  
+  const clientData = {
+    connectedAt: Date.now(),
+    ip: req.ip || req.connection?.remoteAddress || 'unknown'
+  };
+  
+  sseClients.add({ res, ...clientData });
+  req.on('close', () => {
+    sseClients.delete(res);
+    console.log(`[SSE] Client disconnected. Active clients: ${sseClients.size}`);
+  });
+  
+  console.log(`[SSE] Client connected. Active clients: ${sseClients.size}`);
 });
 
-// ── Live frame endpoint ───────────────────────────────────────────────────────
-
-app.get('/frame', (_req, res) => {
-  if (!fs.existsSync(FRAME_PATH)) {
-    return res.status(404).send('No frame yet');
-  }
-  res.setHeader('Content-Type', 'image/png');
-  res.setHeader('Cache-Control', 'no-store');
-  res.send(fs.readFileSync(FRAME_PATH));
-});
-
-// ── Kiro state endpoint ───────────────────────────────────────────────────────
+// ── Cursor state endpoint ───────────────────────────────────────────────────
 
 app.get('/state', (_req, res) => {
   try {
-    const state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
-    res.json({ ok: true, ...state });
-  } catch {
-    res.json({ ok: true, state: 'idle', since: Date.now(), lastResponseText: '' });
-  }
+    if (fs.existsSync(CURSOR_STATE_PATH)) {
+      const state = JSON.parse(fs.readFileSync(CURSOR_STATE_PATH, 'utf8'));
+      return res.json({ ok: true, ...state });
+    }
+  } catch {}
+  res.json({ ok: true, state: 'idle', since: Date.now(), lastResponseText: '' });
 });
 
 // ── Notion: list docs ─────────────────────────────────────────────────────────
@@ -113,7 +121,7 @@ app.post('/token', async (req, res) => {
   if (!token) return res.json({ ok: false, error: 'missing token' });
   try {
     initNotion(token);
-    await listDocs(); // validate
+    await listDocs();
     setConfig('notion_token', token);
     res.json({ ok: true });
   } catch (e) {
@@ -136,18 +144,18 @@ app.post('/cursor-key', (req, res) => {
 let currentRun = null;
 
 app.post('/run', async (req, res) => {
-  const { docId, docTitle, ide = 'kiro' } = req.body;
+  const { docId, docTitle } = req.body;
   if (!docId) return res.json({ ok: false, error: 'missing docId' });
   if (currentRun) return res.json({ ok: false, error: 'already running' });
 
-  currentRun = { docId, docTitle, ide, startedAt: Date.now() };
-  broadcast('run_start', { docId, docTitle, ide });
+  currentRun = { docId, docTitle, ide: 'cursor', startedAt: Date.now() };
+  broadcast('run_start', { docId, docTitle, ide: 'cursor' });
   res.json({ ok: true });
 
   runBuild({
     docId,
     docTitle,
-    ide,
+    ide: 'cursor',
     onStatus: ({ msg, type }) => broadcast('log', { msg, type }),
     onBusMessage: (entry) => broadcast('bus', entry),
     onDone: (projectPath) => {
@@ -165,26 +173,52 @@ app.get('/run/status', (_req, res) => {
   res.json({ running: !!currentRun, run: currentRun });
 });
 
-// ── Frame poller: broadcast state changes ─────────────────────────────────────
+// ── Cursor state poller ───────────────────────────────────────────────────────
 
 let lastState = null;
 setInterval(() => {
   try {
-    const raw = fs.readFileSync(STATE_PATH, 'utf8');
-    const state = JSON.parse(raw);
-    if (state.state !== lastState) {
-      lastState = state.state;
-      broadcast('kiro_state', state);
+    if (fs.existsSync(CURSOR_STATE_PATH)) {
+      const raw = fs.readFileSync(CURSOR_STATE_PATH, 'utf8');
+      const state = JSON.parse(raw);
+      if (state.state !== lastState) {
+        lastState = state.state;
+        broadcast('cursor_state', state);
+      }
     }
   } catch {}
-}, 300);
+}, 1000);
+
+// ── Startup Validation ─────────────────────────────────────────────────────────
+
+function validateEnvironment() {
+  const errors = [];
+  
+  if (!process.env.OPENROUTER_API_KEY && !process.env.GROQ_API_KEY) {
+    errors.push('OPENROUTER_API_KEY not set. Create a .env file with your OpenRouter API key.');
+  }
+  
+  if (errors.length > 0) {
+    console.error('\n❌ IPM Startup Failed:\n');
+    errors.forEach(e => console.error(`  - ${e}`));
+    console.error('\nPlease create a .env file in the project root:\n');
+    console.error('  cp .env.example .env');
+    console.error('  # Then edit .env and add your OpenRouter API key\n');
+    process.exit(1);
+  }
+  
+  console.log('✓ Environment validation passed');
+  console.log('✓ Using Cursor IDE only (Kiro integration removed)');
+  console.log('✓ Architecture: TLI → PMC → CRM → TSP → DCL + MNC');
+}
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
-ensureBridgeInstalled();
-spawnDaemons();
+validateEnvironment();
+ensureIDEInstalled();
 
 app.listen(PORT, () => {
   console.log(`\n  IPM Web Dashboard → http://localhost:${PORT}\n`);
+  console.log('  Agents: TLI | PMC | CRM | TSP | DCL | MNC\n');
   try { execSync(`open http://localhost:${PORT}`); } catch {}
 });

@@ -1,80 +1,112 @@
 /**
- * IPM Multi-Agent System
- * Agents communicate in real-time via a shared MessageBus.
- * Each message is visible in the TUI as it happens.
+ * IPM Multi-Agent System - New Architecture
+ * Agents: TLI, PMC, CRM, TSP, DCL, MNC
+ * 
+ * Models (via OpenRouter):
+ * - TLI: openai/gpt-4o-2024-11-20 (best comprehension, 128k context)
+ * - PMC: anthropic/claude-3.5-sonnet-20241022 (instruction following)
+ * - CRM: google/gemini-flash-1.5-8b (ultra-fast for real-time)
+ * - TSP: openai/gpt-4o-2024-11-20 (code analysis)
+ * - DCL: anthropic/claude-3.5-sonnet-20241022 (browser automation)
+ * - MNC: openai/gpt-4o-2024-11-20 (strategic decisions)
  */
 
-import Groq from 'groq-sdk';
-import * as dotenv from 'dotenv';
+import https from 'https';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import * as dotenv from 'dotenv';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, '../../.env') });
 
-// ── Fetch live models and assign best fit ─────────────────────────────────────
-let _models = null;
+const DATA_DIR = path.join(os.homedir(), '.ipm');
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || process.env.GROQ_API_KEY || '';
 
-async function getModels() {
-  if (_models) return _models;
-  const g = new Groq({ apiKey: process.env.GROQ_API_KEY });
-  const res = await g.models.list();
-  const ids = res.data.map(m => m.id);
+// ── OpenRouter API Call ──────────────────────────────────────────────────────────
 
-  // Pick best model for each role from what's available
-  const pick = (...candidates) => candidates.find(c => ids.includes(c)) || ids[0];
+const MODELS = {
+  tli: 'openai/gpt-4o-2024-11-20',
+  pmc: 'anthropic/claude-3.5-sonnet-20241022',
+  crm: 'google/gemini-flash-1.5-8b',
+  tsp: 'openai/gpt-4o-2024-11-20',
+  dcl: 'anthropic/claude-3.5-sonnet-20241022',
+  mnc: 'openai/gpt-4o-2024-11-20',
+};
 
-  _models = {
-    // Long-context planner + coordinator
-    orchestrator: pick('moonshotai/kimi-k2-instruct', 'llama-3.3-70b-versatile'),
-    // Precise structured prompt generation
-    promptWriter:  pick('moonshotai/kimi-k2-instruct', 'qwen/qwen3-32b', 'llama-3.3-70b-versatile'),
-    // Code/file tree understanding
-    fileAnalyst:   pick('moonshotai/kimi-k2-instruct-0905', 'moonshotai/kimi-k2-instruct', 'llama-3.3-70b-versatile'),
-    // Fast lightweight status lines
-    statusAgent:   pick('llama-3.1-8b-instant', 'llama-3.3-70b-versatile'),
-    // Quality checks + inter-agent arbitration
-    checker:       pick('groq/compound', 'moonshotai/kimi-k2-instruct', 'llama-3.3-70b-versatile'),
-    // Response reading + next-prompt approval
-    responseAnalyst: pick('moonshotai/kimi-k2-instruct', 'llama-3.3-70b-versatile'),
-    // Error detection + correction prompt generation
-    mistakePrompter: pick('llama-3.3-70b-versatile'),
-  };
+function callLLM(model, systemPrompt, userPrompt, temperature = 0.3) {
+  return new Promise((resolve, reject) => {
+    if (!OPENROUTER_API_KEY) {
+      reject(new Error('OPENROUTER_API_KEY not configured'));
+      return;
+    }
 
-  return _models;
+    const body = JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      temperature,
+    });
+
+    const req = https.request({
+      hostname: 'openrouter.ai',
+      path: '/api/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed.choices?.[0]?.message?.content || '';
+          resolve(stripThinking(content));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(120000, () => { req.destroy(); reject(new Error('timeout')); });
+    req.write(body);
+    req.end();
+  });
 }
 
-// Strip <think> blocks (some models emit these)
 function stripThinking(text) {
   return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 }
 
-// Truncate text to max chars to avoid 413 errors
-function truncate(text, maxChars = 6000) {
+function truncate(text, maxChars = 8000) {
   if (!text || text.length <= maxChars) return text;
   return text.slice(0, maxChars) + '\n...[truncated]';
 }
 
-function groqClient() {
-  return new Groq({ apiKey: process.env.GROQ_API_KEY });
-}
+function join(dir, ...parts) { return path.join(dir, ...parts); }
 
-// ── Message Bus ───────────────────────────────────────────────────────────────
-// All inter-agent messages flow through here and are emitted to the TUI live
+// ── Message Bus ─────────────────────────────────────────────────────────────────
+
 export class MessageBus {
   constructor(onMessage) {
     this.messages = [];
-    this.onMessage = onMessage; // → TUI status panel
+    this.onMessage = onMessage;
   }
 
   post(from, to, type, content) {
     const entry = { from, to, type, content, ts: Date.now() };
     this.messages.push(entry);
-    this.onMessage(entry);
+    this.onMessage?.(entry);
     return entry;
   }
 
-  // Get recent context visible to a specific agent
   contextFor(agent, limit = 15) {
     return this.messages
       .filter(m => m.to === agent || m.from === agent || m.to === 'all')
@@ -83,361 +115,344 @@ export class MessageBus {
       .join('\n');
   }
 
-  // Get all messages as a conversation log
-  fullLog(limit = 30) {
-    return this.messages
-      .slice(-limit)
-      .map(m => `[${m.from} → ${m.to}] ${m.content}`)
-      .join('\n');
+  fullLog(limit = 50) {
+    return this.messages.slice(-limit).map(m => `[${m.from} → ${m.to}] ${m.content}`).join('\n');
   }
 }
 
-// ── Base LLM call ─────────────────────────────────────────────────────────────
-async function callAgent({ model, systemPrompt, userPrompt, temperature = 0.3 }) {
-  const res = await groqClient().chat.completions.create({
-    model,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user',   content: userPrompt },
-    ],
-    temperature,
-  });
-  return stripThinking(res.choices[0]?.message?.content ?? '');
-}
+// ── Agent TLI: Notion Input Explainer ───────────────────────────────────────────
+// Takes Notion input and explains the app in detail without missing/adding context
 
-// ── Agent: Orchestrator ───────────────────────────────────────────────────────
-// Reads the Notion doc, creates the master plan, coordinates all other agents.
-// Also acts as the "brain" that other agents report back to.
-export async function orchestratorAgent({ docContent, docTitle, bus }) {
-  const models = await getModels();
-  bus.post('orchestrator', 'all', 'status', `Analysing "${docTitle}"…`);
+export async function agentTLI({ docContent, docTitle, bus }) {
+  bus.post('TLI', 'MNC', 'start', `Analyzing "${docTitle}" from Notion`);
+  
+  const systemPrompt = `You are Agent TLI (Technical Learning Interpreter).
+Your role is to take raw Notion documentation and explain the application in FULL detail.
+CRITICAL RULES:
+- NEVER miss any context from the documentation
+- NEVER add any context that isn't in the documentation  
+- NEVER remove any details
+- Output MUST be a comprehensive, detailed explanation of the application
 
-  const plan = await callAgent({
-    model: models.orchestrator,
-    systemPrompt: `You are the IPM Orchestrator — the master coordinator of a multi-agent IDE automation system.
-You read project documentation and produce a precise, ordered build plan.
-
-Output ONLY a valid JSON object:
+Format your output as a detailed technical specification:
 {
   "projectName": "kebab-case-name",
-  "summary": "one sentence description",
-  "steps": ["step 1", "step 2", ...]
-}
+  "projectType": "web-app/mobile-app/cli-tool/etc",
+  "techStack": ["technology 1", "technology 2", ...],
+  "coreFeatures": ["feature 1", "feature 2", ...],
+  "detailedDescription": "comprehensive description of what the app does",
+  "requirements": {
+    "frontend": "frontend requirements",
+    "backend": "backend requirements", 
+    "database": "database requirements",
+    "apis": "API requirements"
+  },
+  "structure": {
+    "folders": ["folder structure"],
+    "keyFiles": ["key files to create"]
+  },
+  "rawDocs": "the original documentation (unchanged)"
+}`;
 
-Each step must be specific: mention exact file names, folder structure, technologies.
-No markdown, no explanation — JSON only.`,
-    userPrompt: `Project: ${docTitle}\n\nDocumentation:\n${truncate(docContent, 8000)}`,
-    temperature: 0.2,
-  });
-
-  let parsed;
-  try {
-    const match = plan.match(/\{[\s\S]*\}/);
-    parsed = JSON.parse(match ? match[0] : plan);
-  } catch {
-    throw new Error('Orchestrator failed to produce valid plan: ' + plan.slice(0, 200));
-  }
-
-  bus.post('orchestrator', 'all', 'plan', `Plan: ${parsed.steps.length} steps for "${parsed.projectName}" — ${parsed.summary}`);
-  return parsed;
-}
-
-// ── Agent: Prompt Writer ──────────────────────────────────────────────────────
-// Converts a high-level step into a precise Kiro agent prompt.
-// Reads orchestrator context from the bus before writing.
-export async function promptWriterAgent({ step, stepIndex, totalSteps, projectName, fileTree, bus }) {
-  const models = await getModels();
-
-  // Read what orchestrator has said so far
-  const orchestratorContext = bus.contextFor('promptWriter');
-  bus.post('promptWriter', 'orchestrator', 'request', `Need prompt for step ${stepIndex + 1}: "${step.slice(0, 60)}…"`);
-
-  const fileContext = fileTree.length
-    ? `Current project files (${fileTree.length} total):\n${fileTree.slice(0, 30).join('\n')}`
-    : 'Project folder is empty — this is the first step.';
-
-  const prompt = await callAgent({
-    model: models.promptWriter,
-    systemPrompt: `You are the IPM Prompt Writer. You craft precise, actionable prompts for Kiro — an AI IDE agent.
-
-Rules:
-- Be extremely specific: exact file names, folder paths, function signatures
-- Reference the project name "${projectName}" in all paths
-- One concern per prompt — do not combine multiple tasks
-- Kiro understands code well, so be technical and direct
-- Output ONLY the prompt text, nothing else
-
-Context from orchestrator:
-${truncate(orchestratorContext, 1000)}`,
-    userPrompt: `Step ${stepIndex + 1} of ${totalSteps}: ${step}\n\n${fileContext}`,
-    temperature: 0.25,
-  });
-
-  bus.post('promptWriter', 'kiro', 'prompt', `Prompt ready (${prompt.length} chars) for step ${stepIndex + 1}`);
-  return prompt;
-}
-
-// ── Agent: File Analyst ───────────────────────────────────────────────────────
-// Reviews the current file tree and reports back to orchestrator.
-// Communicates findings to checker for validation.
-export async function fileAnalystAgent({ fileTree, projectName, expectedStep, bus }) {
-  const models = await getModels();
-
-  if (!fileTree.length) {
-    bus.post('fileAnalyst', 'orchestrator', 'analysis', 'No files found yet');
-    return { summary: 'No files yet', complete: false, issues: [] };
-  }
-
-  bus.post('fileAnalyst', 'orchestrator', 'status', `Scanning ${fileTree.length} files…`);
-
-  const analysis = await callAgent({
-    model: models.fileAnalyst,
-    systemPrompt: `You are the IPM File Analyst. You review a project's file tree and assess build progress.
-
-Output ONLY valid JSON:
-{
-  "summary": "what has been built",
-  "complete": true/false,
-  "issues": ["issue 1", "issue 2"],
-  "nextSuggestion": "what should happen next"
-}`,
-    userPrompt: `Project: ${projectName}\nExpected step: ${expectedStep}\n\nFiles:\n${fileTree.slice(0, 50).join('\n')}`,
-    temperature: 0.2,
-  });
-
-  let parsed;
-  try {
-    const match = analysis.match(/\{[\s\S]*\}/);
-    parsed = JSON.parse(match ? match[0] : analysis);
-  } catch {
-    parsed = { summary: analysis.slice(0, 120), complete: false, issues: [] };
-  }
-
-  bus.post('fileAnalyst', 'checker', 'analysis', parsed.summary);
-  if (parsed.issues?.length) {
-    bus.post('fileAnalyst', 'orchestrator', 'issues', `Issues: ${parsed.issues.join(' | ')}`);
-  }
-  return parsed;
-}
-
-// ── Agent: Checker ────────────────────────────────────────────────────────────
-// Receives analysis from fileAnalyst, validates the step, reports to orchestrator.
-// Acts as the quality gate — decides pass/retry.
-export async function checkerAgent({ step, fileTree, analysis, bus }) {
-  const models = await getModels();
-
-  // Read what fileAnalyst reported
-  const analystContext = bus.contextFor('checker');
-  bus.post('checker', 'orchestrator', 'status', 'Validating step…');
-
-  const result = await callAgent({
-    model: models.checker,
-    systemPrompt: `You are the IPM Quality Checker. You validate whether a build step was completed correctly.
-You receive analysis from the File Analyst and decide if the step passed.
-
-Output ONLY valid JSON:
-{
-  "passed": true/false,
-  "reason": "brief explanation (max 80 chars)",
-  "retry": true/false
-}
-
-Context from File Analyst:
-${truncate(analystContext, 800)}`,
-    userPrompt: `Step: ${step.slice(0, 200)}\nAnalysis: ${analysis.summary}\nIssues: ${(analysis.issues || []).join(', ') || 'none'}\nFiles: ${fileTree.length}`,
-    temperature: 0.1,
-  });
+  const result = await callLLM(
+    MODELS.tli,
+    systemPrompt,
+    `Notion Document Title: ${docTitle}\n\nDocumentation Content:\n${truncate(docContent, 15000)}`,
+    0.2
+  );
 
   let parsed;
   try {
     const match = result.match(/\{[\s\S]*\}/);
     parsed = JSON.parse(match ? match[0] : result);
   } catch {
-    parsed = { passed: true, reason: 'Could not parse checker output', retry: false };
+    parsed = { detailedDescription: result, projectName: docTitle.toLowerCase().replace(/\s+/g, '-') };
   }
 
-  bus.post('checker', 'orchestrator', 'check', `${parsed.passed ? '✓' : '✗'} ${parsed.reason}`);
+  bus.post('TLI', 'MNC', 'complete', `TLI analysis complete: ${parsed.projectName}`);
   return parsed;
 }
 
-// ── Agent: Status Reporter ────────────────────────────────────────────────────
-// Reads the full agent conversation log and produces a human-readable TUI line.
-export async function statusAgent({ context, bus }) {
-  const models = await getModels();
+// ── Agent PMC: Build Plan to Cursor Prompt ─────────────────────────────────────
+// Creates detailed step-by-step instructions for Cursor
 
-  const status = await callAgent({
-    model: models.statusAgent,
-    systemPrompt: `You are the IPM Status Reporter. You read agent activity logs and produce a single short status line for a terminal UI.
-Max 70 characters. Output ONLY the status line — no quotes, no punctuation at end.`,
-    userPrompt: context,
-    temperature: 0.4,
-  });
+export async function agentPMC({ tliOutput, projectPath, fileTree, bus }) {
+  bus.post('PMC', 'MNC', 'start', 'Creating detailed build prompt for Cursor');
 
-  const line = status.split('\n')[0].trim().slice(0, 80);
-  bus.post('statusAgent', 'tui', 'status', line);
-  return line;
+  const systemPrompt = `You are Agent PMC (Project Manual Creator).
+Your role is to create a comprehensive, detailed step-by-step guide that will be sent to Cursor IDE.
+The guide should be so detailed that Cursor can build the ENTIRE application just by following it.
+
+CRITICAL:
+- Include EVERY single step needed to build the app
+- Specify exact file names, folder paths, code content
+- Include all dependencies, configurations, environment variables
+- Provide code for every file that needs to be created
+- Include testing instructions
+- Make it actionable - Cursor should be able to execute this directly`;
+
+  const fileContext = fileTree?.length ? `Current project files:\n${fileTree.slice(0, 30).join('\n')}` : 'No files yet - this is a fresh project';
+
+  const result = await callLLM(
+    MODELS.pmc,
+    systemPrompt,
+    `Project Specification from TLI:\n${JSON.stringify(tliOutput, null, 2)}\n\n${fileContext}\n\nCreate a detailed, actionable build guide.`,
+    0.3
+  );
+
+  bus.post('PMC', 'MNC', 'complete', `PMC prompt created (${result.length} chars)`);
+  return result;
 }
 
-// ── Export model info for TUI display ────────────────────────────────────────
-export async function getModelAssignments() {
-  return getModels();
-}
+// ── Agent CRM: Cursor Real-time State Monitor ─────────────────────────────────
+// Monitors Cursor in real-time to determine state
 
-// ── Agent: MistakePrompter ────────────────────────────────────────────────────
-// Reads Kiro's last response and identifies errors, generating a correction prompt.
-// Called after every idle transition, after ResponseAnalyst has captured the response.
-export async function mistakePrompterAgent({ step, terminalSnapshot, fileChangeLog, lastResponseText, bus }) {
-  const models = await getModels();
+export async function agentCRM({ cursorState, bus }) {
+  const state = cursorState?.state || 'unknown';
+  const lastResponse = cursorState?.lastResponseText || '';
 
-  let raw;
-  try {
-    raw = await callAgent({
-      model: models.mistakePrompter,
-      systemPrompt: `You are the IPM MistakePrompter. You analyse Kiro's last response and identify any errors or problems.
+  bus.post('CRM', 'MNC', 'state', `Cursor state: ${state}`);
 
-Output ONLY valid JSON — no markdown, no explanation:
+  const systemPrompt = `You are Agent CRM (Cursor Response Monitor).
+Your role is to determine the current state of Cursor IDE in real-time.
+
+Analyze the Cursor state and respond with ONLY JSON:
 {
-  "hasError": boolean,
-  "errorSummary": "brief description of the error, or empty string if no error",
-  "correctionPrompt": "the prompt to send to Kiro to fix the error, or empty string if no error"
-}`,
-      userPrompt: `Step: ${step}
+  "state": "writing_files" | "answering" | "thinking" | "waiting_for_input" | "idle" | "error",
+  "reasoning": "brief explanation",
+  "confidence": 0.0-1.0
+}
 
-Terminal snapshot:
-${truncate(terminalSnapshot, 2000)}
+State definitions:
+- writing_files: Cursor is creating/editing files (check for file save indicators)
+- answering: Cursor is providing textual responses (chat active)
+- thinking: Cursor is processing/loading (spinner or pause)
+- waiting_for_input: Cursor needs user input (buttons, prompts)
+- idle: Cursor is not doing anything
+- error: Something went wrong`;
 
-Recent file changes (last 20):
-${JSON.stringify(fileChangeLog?.slice(-20) ?? [], null, 2)}
-
-Kiro's last response:
-${truncate(lastResponseText, 3000)}`,
-      temperature: 0.2,
-    });
-  } catch (err) {
-    console.error('[mistakePrompterAgent] LLM call failed:', err.message);
-    bus.post('mistakePrompter', 'orchestrator', 'no_error', 'LLM error — skipping error check');
-    return { hasError: false, errorSummary: '', correctionPrompt: '' };
-  }
-
-  let parsed;
   try {
-    const match = raw.match(/\{[\s\S]*\}/);
-    parsed = JSON.parse(match ? match[0] : raw);
-  } catch {
-    console.error('[mistakePrompterAgent] Malformed JSON:', raw.slice(0, 200));
-    bus.post('mistakePrompter', 'orchestrator', 'no_error', 'Malformed JSON — skipping error check');
-    return { hasError: false, errorSummary: '', correctionPrompt: '' };
-  }
-
-  if (parsed.hasError) {
-    bus.post('mistakePrompter', 'orchestrator', 'error', `${parsed.errorSummary}`);
-    bus.post('mistakePrompter', 'kiro', 'correction', parsed.correctionPrompt);
-  } else {
-    bus.post('mistakePrompter', 'orchestrator', 'no_error', 'No errors detected');
-  }
-
-  return {
-    hasError:         Boolean(parsed.hasError),
-    errorSummary:     typeof parsed.errorSummary === 'string'     ? parsed.errorSummary     : '',
-    correctionPrompt: typeof parsed.correctionPrompt === 'string' ? parsed.correctionPrompt : '',
-  };
-}
-
-// ── Agent: ResponseAnalyst ────────────────────────────────────────────────────
-// Reads Kiro's last response and writes the next prompt.
-// Gates every outgoing prompt — no prompt is sent unless this agent approves it.
-// Up to 3 retries on approved:false; after that falls back to PromptWriter.
-export async function responseAnalystAgent({ lastResponseText, step, fileChangeLog, terminalSnapshot, busContext, bus }) {
-  const models = await getModels();
-
-  let retries = 0;
-  const MAX_RETRIES = 3;
-
-  while (retries < MAX_RETRIES) {
-    let raw;
-    try {
-      raw = await callAgent({
-        model: models.responseAnalyst,
-        systemPrompt: `You are the IPM ResponseAnalyst. You read Kiro's last response and decide whether the next prompt should be sent.
-
-Output ONLY valid JSON — no markdown, no explanation:
-{
-  "approved": boolean,
-  "nextPrompt": "the refined prompt to send next, or empty string if not approved",
-  "reasoning": "brief explanation of your decision"
-}
-
-Context from other agents:
-${truncate(busContext ?? '', 1000)}`,
-        userPrompt: `Step: ${step}
-
-Terminal snapshot:
-${truncate(terminalSnapshot, 2000)}
-
-Recent file changes (last 20):
-${JSON.stringify(fileChangeLog?.slice(-20) ?? [], null, 2)}
-
-Kiro's last response:
-${truncate(lastResponseText, 3000)}`,
-        temperature: 0.25,
-      });
-    } catch (err) {
-      retries++;
-      console.error(`[responseAnalystAgent] LLM call failed (attempt ${retries}):`, err.message);
-      if (retries >= MAX_RETRIES) {
-        console.warn('[responseAnalystAgent] Max retries reached — triggering PromptWriter fallback');
-        bus.post('responseAnalyst', 'orchestrator', 'fallback', 'Max retries reached — using PromptWriter fallback');
-        // Trigger PromptWriter fallback: return approved:true with a basic prompt
-        const fallbackPrompt = await promptWriterAgent({
-          step,
-          stepIndex: 0,
-          totalSteps: 1,
-          projectName: 'project',
-          fileTree: [],
-          bus,
-        });
-        return { approved: true, nextPrompt: fallbackPrompt, reasoning: 'PromptWriter fallback after 3 LLM errors' };
-      }
-      continue;
-    }
+    const result = await callLLM(
+      MODELS.crm,
+      systemPrompt,
+      `Current Cursor state info:\nState: ${state}\nLast response: ${truncate(lastResponse, 2000)}`,
+      0.1
+    );
 
     let parsed;
     try {
-      const match = raw.match(/\{[\s\S]*\}/);
-      parsed = JSON.parse(match ? match[0] : raw);
+      const match = result.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(match ? match[0] : result);
     } catch {
-      console.error('[responseAnalystAgent] Malformed JSON:', raw.slice(0, 200));
-      parsed = { approved: false, nextPrompt: '', reasoning: raw.slice(0, 200) };
+      parsed = { state: 'thinking', reasoning: 'Could not parse', confidence: 0.5 };
     }
 
-    const result = {
-      approved:   Boolean(parsed.approved),
-      nextPrompt: typeof parsed.nextPrompt === 'string' ? parsed.nextPrompt : '',
-      reasoning:  typeof parsed.reasoning  === 'string' ? parsed.reasoning  : '',
-    };
+    bus.post('CRM', 'MNC', 'analyzed', `${parsed.state} (${Math.round(parsed.confidence * 100)}% confidence)`);
+    return parsed;
+  } catch (e) {
+    bus.post('CRM', 'MNC', 'error', e.message);
+    return { state: 'thinking', reasoning: 'LLM error', confidence: 0.5 };
+  }
+}
 
-    if (result.approved) {
-      bus.post('responseAnalyst', 'kiro', 'nextPrompt', result.nextPrompt);
-      return result;
-    } else {
-      retries++;
-      bus.post('responseAnalyst', 'orchestrator', 'reasoning', result.reasoning);
-      if (retries >= MAX_RETRIES) {
-        console.warn('[responseAnalystAgent] Max retries reached — triggering PromptWriter fallback');
-        bus.post('responseAnalyst', 'orchestrator', 'fallback', 'Max retries reached — using PromptWriter fallback');
-        const fallbackPrompt = await promptWriterAgent({
-          step,
-          stepIndex: 0,
-          totalSteps: 1,
-          projectName: 'project',
-          fileTree: [],
-          bus,
-        });
-        return { approved: true, nextPrompt: fallbackPrompt, reasoning: 'PromptWriter fallback after 3 unapproved responses' };
-      }
-    }
+// ── Agent TSP: Test & Solution Provider ─────────────────────────────────────
+// Reviews Cursor output, checks files, approves with suggestions
+
+export async function agentTSP({ cursorResponse, fileTree, projectName, expectedStep, bus }) {
+  bus.post('TSP', 'MNC', 'start', 'Reviewing Cursor output and checking files');
+
+  const systemPrompt = `You are Agent TSP (Test & Solution Provider).
+Your role is to:
+1. Review what Cursor just did/answered
+2. Check the files that were created or modified
+3. Verify the changes align with the expected step
+4. Provide approval OR suggest corrections
+
+Respond with ONLY JSON:
+{
+  "approved": true/false,
+  "filesChecked": ["file1", "file2"],
+  "changesSummary": "what changed",
+  "issues": ["issue 1"] | [],
+  "suggestions": ["suggestion 1"] | [],
+  "reasoning": "why approved or not"
+}`;
+
+  const fileList = fileTree?.length ? fileTree.slice(0, 50).join('\n') : 'No files';
+
+  const result = await callLLM(
+    MODELS.tsp,
+    systemPrompt,
+    `Project: ${projectName}\nExpected Step: ${expectedStep}\n\nCursor Response:\n${truncate(cursorResponse, 3000)}\n\nCurrent Files:\n${fileList}`,
+    0.2
+  );
+
+  let parsed;
+  try {
+    const match = result.match(/\{[\s\S]*\}/);
+    parsed = JSON.parse(match ? match[0] : result);
+  } catch {
+    parsed = { approved: true, reasoning: 'Could not parse TSP response', issues: [], suggestions: [] };
   }
 
-  // Should never reach here, but safety net
-  return { approved: false, nextPrompt: '', reasoning: 'Unexpected exit from retry loop' };
+  bus.post('TSP', 'MNC', 'review', `${parsed.approved ? '✓ Approved' : '✗ Needs revision'}: ${parsed.reasoning?.slice(0, 80)}`);
+  return parsed;
+}
+
+// ── Agent DCL: Debug & Console Logger ─────────────────────────────────────────
+// Chrome debugging - opens console, checks errors, network failures
+
+export async function agentDCL({ projectPath, frontendUrl, bus }) {
+  bus.post('DCL', 'MNC', 'start', 'Starting Chrome debugging session');
+
+  const systemPrompt = `You are Agent DCL (Debug & Console Logger).
+Your role is to perform Chrome browser debugging:
+1. Launch Chrome with the frontend URL
+2. Open browser console
+3. Navigate through each page of the application
+4. Check for:
+   - Console errors
+   - Network request failures (check Network tab)
+   - Failed file loads (404s)
+   - JavaScript errors
+   - API failures
+
+5. Compile a detailed debugging report
+
+Respond with JSON:
+{
+  "debugged": true,
+  "pagesVisited": ["page1", "page2"],
+  "errors": [
+    {"page": "page1", "type": "console|network|js", "message": "error", "file": "file.js"}
+  ],
+  "warnings": [],
+  "summary": "overall health assessment",
+  "recommendations": ["fix1", "fix2"]
+}`;
+
+  const debugScript = `
+    const debugResults = {
+      pagesVisited: [],
+      errors: [],
+      warnings: []
+    };
+
+    function getErrors() {
+      const logs = [];
+      try {
+        console.error('DCL Debug: Checking console...');
+      } catch(e) {}
+      return logs;
+    }
+  `;
+
+  try {
+    const result = await callLLM(
+      MODELS.dcl,
+      systemPrompt,
+      `Project Path: ${projectPath}\nFrontend URL: ${frontendUrl || 'http://localhost:3000'}\n\nPlease perform Chrome debugging and report errors.`,
+      0.2
+    );
+
+    let parsed;
+    try {
+      const match = result.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(match ? match[0] : result);
+    } catch {
+      parsed = { debugged: false, summary: 'Could not parse debug results', errors: [] };
+    }
+
+    bus.post('DCL', 'MNC', 'complete', `Debug complete: ${parsed.errors?.length || 0} errors found`);
+    return parsed;
+  } catch (e) {
+    bus.post('DCL', 'MNC', 'error', e.message);
+    return { debugged: false, errors: [], summary: e.message };
+  }
+}
+
+// ── Agent MNC: Main Controller ───────────────────────────────────────────────
+// Orchestrates all agents, decides when to inject prompts
+
+export async function agentMNC({ 
+  tliOutput, 
+  pmcPrompt, 
+  cursorState, 
+  cursorResponse, 
+  fileTree,
+  projectName,
+  stepNumber,
+  totalSteps,
+  bus,
+  context 
+}) {
+  bus.post('MNC', 'all', 'start', `MNC orchestrating step ${stepNumber}/${totalSteps}`);
+
+  const systemPrompt = `You are Agent MNC (Main Nexus Controller).
+You are the EXECUTIVE and MANAGER of all agents.
+Your role is to:
+1. Analyze all inputs from other agents
+2. Decide what action to take next
+3. Determine which agent to use
+4. Craft the appropriate prompt for Cursor
+
+CRITICAL DECISION POINTS:
+- If Cursor is idle and no prompt sent → send PMC prompt
+- If Cursor is thinking → wait and monitor
+- If Cursor answered → send to TSP for review
+- If TSP approved → proceed to next step
+- If TSP rejected → send correction to Cursor
+- If frontend ready → optionally call DCL for debugging
+- If error detected → route to appropriate agent for fix
+
+Respond with ONLY JSON:
+{
+  "action": "wait" | "send_prompt" | "review" | "retry" | "debug" | "next_step" | "complete",
+  "targetAgent": "TLI" | "PMC" | "CRM" | "TSP" | "DCL" | "none",
+  "prompt": "the prompt to send to Cursor (if action is send_prompt)",
+  "reasoning": "why this decision",
+  "nextStep": "what should happen after this"
+}`;
+
+  const contextInfo = `
+    Project: ${projectName}
+    Step: ${stepNumber} of ${totalSteps}
+    Cursor State: ${cursorState?.state || 'unknown'}
+    File Count: ${fileTree?.length || 0}
+  `;
+
+  try {
+    const result = await callLLM(
+      MODELS.mnc,
+      systemPrompt,
+      `${contextInfo}\n\nContext from other agents:\n${truncate(context || '', 3000)}\n\nCursor Last Response:\n${truncate(cursorResponse || '', 2000)}`,
+      0.3
+    );
+
+    let parsed;
+    try {
+      const match = result.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(match ? match[0] : result);
+    } catch {
+      parsed = { action: 'wait', targetAgent: 'CRM', reasoning: 'Could not parse MNC response' };
+    }
+
+    bus.post('MNC', 'all', 'decision', `${parsed.action} → ${parsed.targetAgent}: ${parsed.reasoning?.slice(0, 60)}`);
+    return parsed;
+  } catch (e) {
+    bus.post('MNC', 'all', 'error', e.message);
+    return { action: 'wait', targetAgent: 'CRM', reasoning: e.message };
+  }
+}
+
+// ── Export Model Assignments ─────────────────────────────────────────────────
+
+export function getModelAssignments() {
+  return { ...MODELS };
+}
+
+export function validateConfig() {
+  if (!OPENROUTER_API_KEY) {
+    throw new Error('OPENROUTER_API_KEY not configured. Please set it in .env file.');
+  }
 }

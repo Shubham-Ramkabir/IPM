@@ -9,14 +9,27 @@ import fs from 'fs';
 import { getConfig, setConfig } from '../db/index.js';
 import { initNotion, listDocs } from '../agent/notion.js';
 import { runBuild } from '../agent/runner.js';
-import { ensureBridgeInstalled } from '../agent/ide.js';
-import { spawnDaemons } from '../agent/daemons.js';
+import { ensureIDEInstalled } from '../agent/ide.js';
 import { ScreenPreview } from './ScreenPreview.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, '../../.env') });
 
 const ENV_PATH = join(__dirname, '../../.env');
+
+function validateEnvironment() {
+  if (!process.env.OPENROUTER_API_KEY && !process.env.GROQ_API_KEY) {
+    console.error('\n❌ IPM Startup Failed: OPENROUTER_API_KEY is not set.\n');
+    console.error('Please create a .env file in the project root:');
+    console.error('  cp .env.example .env');
+    console.error('  # Then edit .env and add your OpenRouter API key\n');
+    process.exit(1);
+  }
+  console.log('✓ Environment validated');
+  console.log('✓ Using Cursor IDE only');
+  console.log('✓ Architecture: TLI | PMC | CRM | TSP | DCL | MNC\n');
+}
+validateEnvironment();
 
 function writeCursorKeyToEnv(key) {
   try {
@@ -37,28 +50,29 @@ try { ipmArt = figlet.textSync('IPM', { font: 'Small' }); } catch (_) {}
 const ORANGE = '#FF6400';
 
 const AGENT_COLOR = {
-  orchestrator:    '#FF6400',
-  promptWriter:    '#00ccff',
-  fileAnalyst:     '#6699ff',
-  checker:         '#ffcc00',
-  statusAgent:     '#aaaaaa',
-  kiro:            '#00ff88',
-  tui:             '#ffffff',
-  all:             '#888888',
-  mistakePrompter: '#ff4466',
-  responseAnalyst: '#cc88ff',
+  TLI:            '#FF6400',
+  PMC:            '#00ccff',
+  CRM:            '#00ff88',
+  TSP:            '#ffcc00',
+  DCL:            '#ff4466',
+  MNC:            '#cc88ff',
+  cursor:         '#00ff88',
+  tui:            '#ffffff',
+  all:            '#888888',
+  runner:         '#aaaaaa',
 };
 
 const AGENT_LABEL = {
-  orchestrator:    'Orchestrator',
-  promptWriter:    'PromptWriter',
-  fileAnalyst:     'FileAnalyst',
-  checker:         'Checker',
-  statusAgent:     'StatusAgent',
-  kiro:            'Kiro',
-  tui:             'TUI',
-  all:             'ALL',
-  mistakePrompter: 'MistakePrompter',
+  TLI:            'Agent TLI',
+  PMC:            'Agent PMC',
+  CRM:            'Agent CRM',
+  TSP:            'Agent TSP',
+  DCL:            'Agent DCL',
+  MNC:            'Agent MNC',
+  cursor:         'Cursor',
+  tui:            'TUI',
+  all:            'ALL',
+  runner:         'Runner',
   responseAnalyst: 'ResponseAnalyst',
 };
 
@@ -304,11 +318,11 @@ function AgentCommsPanel({ entries, scrollOffset, height }) {
   const start = Math.max(0, entries.length - height - scrollOffset);
   const visible = entries.slice(start, start + height);
 
-  // Find the most recent kiroState entry to show above the panel
-  const lastKiroState = [...entries].reverse().find(e => e.type === 'kiroState');
+  // Find the most recent cursorState entry to show above the panel
+  const lastCursorState = [...entries].reverse().find(e => e.type === 'cursorState');
 
   return h(Box, { flexDirection: 'column', height, overflow: 'hidden' },
-    lastKiroState && h(Text, { color: '#00ff88', bold: true }, 'Kiro: ' + lastKiroState.msg),
+    lastCursorState && h(Text, { color: '#00ff88', bold: true }, 'Cursor: ' + lastCursorState.msg),
     visible.length === 0
       ? h(Text, { dimColor: true }, '  Waiting for agents...')
       : visible.map((e, i) => {
@@ -339,12 +353,12 @@ function AgentCommsPanel({ entries, scrollOffset, height }) {
           }
           const typeColor = {
             info: 'white', thinking: ORANGE, prompting: 'cyan',
-            kiro: 'green', reading: '#6699ff', detail: 'gray',
+            cursor: 'green', reading: '#6699ff', detail: 'gray',
             done: 'green', error: 'red',
           }[e.type] || 'white';
           const typeIcon = {
             info: '.', thinking: '~', prompting: '>',
-            kiro: '*', reading: '#', detail: ' ',
+            cursor: '*', reading: '#', detail: ' ',
             done: 'v', error: 'x',
           }[e.type] || '.';
           return h(Box, { key: i },

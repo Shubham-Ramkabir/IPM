@@ -1,2 +1,7 @@
 #!/usr/bin/env node
-import('../src/tui/index.js');
+/**
+ * IPM CLI Entry Point
+ * Opens the web dashboard in browser
+ */
+
+import('../src/web/server.js');
